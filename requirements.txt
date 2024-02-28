@@ -5,6 +5,5 @@ kawpow
 meowpow @ git+https://https://github.com/zachchan105/cpp-meowpow
 uvloop
 aiorpcx[ws]>=0.22,<0.23
-
 x16r_hash @ git+https://github.com/brian112358/x16r_hash
 x16rv2_hash @ git+https://github.com/RavenCommunity/x16rv2_hash
