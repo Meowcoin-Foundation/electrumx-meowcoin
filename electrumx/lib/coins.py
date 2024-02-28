@@ -46,6 +46,7 @@ from electrumx.server.session import ElectrumX
 import x16r_hash
 import x16rv2_hash
 import kawpow
+import meowpow
 
 Block = namedtuple("Block", "raw header transactions")
 
@@ -260,6 +261,59 @@ class Ravencoin(Coin):
     def header_hash(cls, header):
         '''Given a header return the hash.'''
         timestamp = util.unpack_le_uint32_from(header, 68)[0]
+        if timestamp >= cls.KAWPOW_ACTIVATION_TIME:
+            nNonce64 = util.unpack_le_uint64_from(header, 80)[0]  # uint64_t
+            mix_hash = header[119:87:-1]  # uint256
+            header_hash = double_sha256(header[:80])[::-1]
+            return kawpow.light_verify(header_hash, mix_hash, nNonce64)[::-1]
+        elif timestamp >= cls.X16RV2_ACTIVATION_TIME:
+            return x16rv2_hash.getPoWHash(header)
+        else:
+            return x16r_hash.getPoWHash(header)
+        
+
+class Meowcoin(Coin):
+    NAME = "Meowcoin"
+    SHORTNAME = "MEWC"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("0488B21E")
+    XPRV_VERBYTES = bytes.fromhex("0488ADE4")
+    P2PKH_VERBYTE = bytes.fromhex("32")
+    P2SH_VERBYTES = [bytes.fromhex("7A")]
+    GENESIS_HASH = ('000000edd819220359469c54f2614b56'
+                    '02ebc775ea67a64602f354bdaa320f70')
+    DEFAULT_MAX_SEND = 10_000_000
+    X16RV2_ACTIVATION_TIME = 1569945600   # algo switch to x16rv2 at this timestamp
+    KAWPOW_ACTIVATION_TIME = 1662493424  # kawpow algo activation time
+    MEOWPOW_ACTIVATION_TIME = 1710799200  # meowpow algo activation time
+    KAWPOW_ACTIVATION_HEIGHT = 1219736
+    KAWPOW_HEADER_SIZE = 120
+    
+    CHAIN_SIZE = 1
+    CHAIN_SIZE_HEIGHT = 1
+    AVG_BLOCK_SIZE = 12_681
+    
+    RPC_PORT = 9766
+    REORG_LIMIT = 60
+    PEERS = []
+
+    @classmethod
+    def static_header_offset(cls, height):
+        '''Given a header height return its offset in the headers file.'''
+        if cls.KAWPOW_ACTIVATION_HEIGHT < 0 or height < cls.KAWPOW_ACTIVATION_HEIGHT:
+            return height * cls.BASIC_HEADER_SIZE
+        else:  # RVN block header size increased with kawpow fork
+            return (cls.KAWPOW_ACTIVATION_HEIGHT * cls.BASIC_HEADER_SIZE) + ((height - cls.KAWPOW_ACTIVATION_HEIGHT) * cls.KAWPOW_HEADER_SIZE)
+
+    @classmethod
+    def header_hash(cls, header):
+        '''Given a header return the hash.'''
+        timestamp = util.unpack_le_uint32_from(header, 68)[0]
+        if timestamp >= cls.MEOWPOW_ACTIVATION_TIME:
+            nNonce64 = util.unpack_le_uint64_from(header, 80)[0]  # uint64_t
+            mix_hash = header[119:87:-1]  # uint256
+            header_hash = double_sha256(header[:80])[::-1]
+            return meowpow.light_verify(header_hash, mix_hash, nNonce64)[::-1]
         if timestamp >= cls.KAWPOW_ACTIVATION_TIME:
             nNonce64 = util.unpack_le_uint64_from(header, 80)[0]  # uint64_t
             mix_hash = header[119:87:-1]  # uint256

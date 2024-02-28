@@ -2,6 +2,7 @@ aiohttp>=3.3,<4.0
 pylru
 plyvel
 kawpow
+meowpow @ git+https://https://github.com/zachchan105/cpp-meowpow
 uvloop
 aiorpcx[ws]>=0.22,<0.23
 
