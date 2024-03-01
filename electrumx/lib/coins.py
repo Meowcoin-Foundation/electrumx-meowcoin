@@ -284,9 +284,9 @@ class Meowcoin(Coin):
                     '02ebc775ea67a64602f354bdaa320f70')
     DEFAULT_MAX_SEND = 10_000_000
     X16RV2_ACTIVATION_TIME = 1569945600   # algo switch to x16rv2 at this timestamp
-    KAWPOW_ACTIVATION_TIME = 1662493424  # kawpow algo activation time
+    KAWPOW_ACTIVATION_TIME = 1662493564  # kawpow algo activation time
     MEOWPOW_ACTIVATION_TIME = 1710799200  # meowpow algo activation time
-    KAWPOW_ACTIVATION_HEIGHT = 1219736
+    KAWPOW_ACTIVATION_HEIGHT = 373
     KAWPOW_HEADER_SIZE = 120
     
     CHAIN_SIZE = 1
