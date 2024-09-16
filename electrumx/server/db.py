@@ -1166,7 +1166,8 @@ class DB:
                         tx_num, = unpack_le_uint64(db_key[-5:] + bytes(3))
                         tx_hash, height = self.fs_tx_hash(tx_num)
                         asset_id = db_key[-13:-9]
-                        asset_str = self.get_asset_for_id(asset_id)
+                        asset_b = self.get_asset_for_id(asset_id)
+                        asset_str = None if asset_b is None else asset_b.decode()
                         utxos_append(UTXO(tx_num, tx_pos, tx_hash, height, asset_str, value))
             return utxos
 
@@ -1222,7 +1223,8 @@ class DB:
                     # getting the hashXs and getting the UTXOs
                     return None
                 value, = unpack_le_uint64(db_value)
-                asset_str = self.get_asset_for_id(asset_id)
+                asset_b = self.get_asset_for_id(asset_id)
+                asset_str = None if asset_b is None else asset_b.decode()
                 return hashX, asset_str, value
             return [lookup_utxo(*hashX_pair) for hashX_pair in hashX_pairs]
 
@@ -1570,7 +1572,7 @@ class DB:
 
     async def get_assets_with_prefix(self, prefix: bytes):
         def find_assets():
-            return [asset.decode('ascii') for asset, _ in self.suid_db.iterator(prefix=PREFIX_ASSET_TO_ID+prefix)]
+            return [asset[1:].decode('ascii') for asset, _ in self.suid_db.iterator(prefix=PREFIX_ASSET_TO_ID+prefix)]
         return await run_in_thread(find_assets)
 
     async def lookup_asset_meta_history(self, asset_name: bytes):
