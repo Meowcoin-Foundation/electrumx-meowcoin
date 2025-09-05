@@ -26,7 +26,7 @@ from aiorpcx import CancelledError, run_in_thread, spawn
 
 import electrumx
 from electrumx.lib.addresses import public_key_to_address
-from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
+from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN, double_sha256
 from electrumx.lib.script import is_unspendable_legacy, \
     is_unspendable_genesis, OpCodes, Script, ScriptError
 from electrumx.lib.tx import Deserializer
@@ -66,11 +66,11 @@ class OPPushDataGeneric:
 
 
 # Marks an address as valid for restricted assets via qualifier or restricted itself.
-ASSET_NULL_TEMPLATE = [OpCodes.OP_RVN_ASSET, OPPushDataGeneric(lambda x: x == 20), OPPushDataGeneric()]
+ASSET_NULL_TEMPLATE = [OpCodes.OP_MEWC_ASSET, OPPushDataGeneric(lambda x: x == 20), OPPushDataGeneric()]
 # Used with creating restricted assets. Dictates the qualifier assets associated.
-ASSET_NULL_VERIFIER_TEMPLATE = [OpCodes.OP_RVN_ASSET, OpCodes.OP_RESERVED, OPPushDataGeneric()]
+ASSET_NULL_VERIFIER_TEMPLATE = [OpCodes.OP_MEWC_ASSET, OpCodes.OP_RESERVED, OPPushDataGeneric()]
 # Stop all movements of a restricted asset.
-ASSET_GLOBAL_RESTRICTION_TEMPLATE = [OpCodes.OP_RVN_ASSET, OpCodes.OP_RESERVED, OpCodes.OP_RESERVED,
+ASSET_GLOBAL_RESTRICTION_TEMPLATE = [OpCodes.OP_MEWC_ASSET, OpCodes.OP_RESERVED, OpCodes.OP_RESERVED,
                                      OPPushDataGeneric()]
 
 
@@ -151,9 +151,9 @@ class OnDiskBlock:
         return datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
 
     def iter_txs(self):
-        # Asynchronous generator of (tx, tx_hash) pairs
+        # Generator of (tx, tx_hash) pairs
         raw = self._read(self.chunk_size)
-        deserializer = Deserializer(raw)
+        deserializer = self.coin.DESERIALIZER(raw)
         tx_count = deserializer.read_varint()
 
         if self.log_block:
@@ -175,10 +175,10 @@ class OnDiskBlock:
                 pass
 
             if tx_count == count:
-
                 return
+                
             raw = raw[cursor:] + self._read(self.chunk_size)
-            deserializer = Deserializer(raw)
+            deserializer = self.coin.DESERIALIZER(raw)
 
     def _chunk_offsets(self):
         '''Iterate the transactions forwards to find their boundaries.'''
@@ -642,7 +642,6 @@ class BlockProcessor:
             ) // one_MB
 
             #from electrumx.lib.util import deep_getsizeof
-            #print(f'utxo predicted: {utxo_cache_size}, utxo real: {deep_getsizeof(self.utxo_cache)}')
 
             OnDiskBlock.log_block = True
             if hist_cache_size:
@@ -777,13 +776,21 @@ class BlockProcessor:
         to_le_uint64 = pack_le_uint64
         utxo_count_delta = 0
 
-        with block as block:
-            if self.coin.header_prevhash(block.header) != self.state.tip:
+        with block as raw_block:
+            # Read the complete raw block data
+            raw_block.block_file.seek(0)
+            complete_raw_block = raw_block.block_file.read()
+            
+            # Parse the block using the coin's deserializer
+            parsed_block = self.coin.block(complete_raw_block, raw_block.height)
+            
+            if self.coin.header_prevhash(parsed_block.header) != self.state.tip:
                 self.reorg_count = -1
                 return
             
             self.ok = False
-            for tx, tx_hash in block.iter_txs():
+            for tx in parsed_block.transactions:
+                tx_hash = tx.txid if hasattr(tx, 'txid') else double_sha256(tx.serialize())
                 hashXs = []
                 inputHashXs = defaultdict(set)
                 append_hashX = hashXs.append
@@ -852,7 +859,7 @@ class BlockProcessor:
                     op_ptr = -1
                     for i in range(len(ops)):
                         op = ops[i][0]  # The OpCode
-                        if op == OpCodes.OP_RVN_ASSET:
+                        if op == OpCodes.OP_MEWC_ASSET:
                             op_ptr = i
                             break
                         if op == -1:
@@ -860,7 +867,7 @@ class BlockProcessor:
                             break
 
                     if invalid_script:
-                        # This script could not be parsed properly before any OP_RVN_ASSETs.
+                        # This script could not be parsed properly before any OP_MEWC_ASSETs.
                         # Hash as-is for possible spends and continue.
                         hashX = script_hashX(txout.pk_script)
                         append_hashX(hashX)
@@ -964,12 +971,12 @@ class BlockProcessor:
                         continue
 
                     if op_ptr > 0:
-                        # This script has OP_RVN_ASSET. Use everything before this for the script hash.
+                        # This script has OP_MEWC_ASSET. Use everything before this for the script hash.
                         # Get the raw script bytes ending ptr from the previous opcode.
                         script_hash_end = ops[op_ptr - 1][1]
                         hashX = script_hashX(txout.pk_script[:script_hash_end])
                     else:
-                        # There is no OP_RVN_ASSET. Hash as-is.
+                        # There is no OP_MEWC_ASSET. Hash as-is.
                         hashX = script_hashX(txout.pk_script)
 
                     # Now try and add asset info
@@ -1151,7 +1158,7 @@ class BlockProcessor:
                     # https://www.youtube.com/watch?v=iZlpsneDGBQ
 
                     if 0 < op_ptr < len(ops):
-                        assert ops[op_ptr][0] == OpCodes.OP_RVN_ASSET  # Sanity check
+                        assert ops[op_ptr][0] == OpCodes.OP_MEWC_ASSET  # Sanity check
                         try:
                             next_op = ops[op_ptr + 1]
                             if next_op[0] == -1:
