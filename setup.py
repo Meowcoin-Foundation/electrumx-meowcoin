@@ -8,7 +8,7 @@ with open('requirements.txt', 'r') as f:
     requirements = f.read().splitlines()
 
 setuptools.setup(
-    name='electrumX-ravencoin',
+    name='electrumX-meowcoin',
     version=version,
     scripts=['electrumx_server', 'electrumx_rpc', 'electrumx_compact_history'],
     python_requires='>=3.8',
@@ -18,13 +18,13 @@ setuptools.setup(
         'uvloop': ['uvloop>=0.17'],
     },
     packages=setuptools.find_packages(include=('electrumx*',)),
-    description='ElectrumX Server',
-    author='Neil Booth',
-    author_email='kyuupichan@gmail.com',
+    description='ElectrumX Meowcoin Server',
+    author='Topper',
+    author_email='topper@topper.site',
     license='MIT Licence',
-    url='https://github.com/Electrum-RVN-SIG/electrumx-ravencoin',
-    long_description='Ravencoin server implementation for the Electrum protocol',
-    download_url=('https://github.com/Electrum-RVN-SIG/electrumx-ravencoin/archive/'
+    url='https://github.com/Meowcoin-Foundation/electrumx-meowcoin',
+    long_description='Meowcoin server implementation for the Electrum protocol',
+    download_url=('https://github.com/Meowcoin-Foundation/electrumx-meowcoin/archive/'
                   f'{version}.tar.gz'),
     classifiers=[
         'Development Status :: 5 - Production/Stable',

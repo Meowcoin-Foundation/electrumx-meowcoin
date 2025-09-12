@@ -55,6 +55,36 @@ class CoinError(Exception):
     '''Exception raised for coin-related errors.'''
 
 
+class AuxPowMixin:
+    '''Mixin for AuxPOW coin support.'''
+    STATIC_BLOCK_HEADERS = True  # FIXED: Use truncated headers for Electrum compatibility
+    DESERIALIZER = lib_tx.DeserializerAuxPow
+    TRUNCATED_HEADER_SIZE = 80
+    # AuxPoW headers are significantly larger, so increase DEFAULT_MAX_SEND
+    DEFAULT_MAX_SEND = 10_000_000
+
+    @classmethod
+    def header_hash(cls, header):
+        '''Given a header return hash'''
+        return double_sha256(header[:cls.BASIC_HEADER_SIZE])
+
+    @classmethod
+    def block_header(cls, block, height):
+        '''Return the block header bytes - truncated for Electrum compatibility'''
+        # Check if this is an AuxPOW block
+        version_int = int.from_bytes(block[:4], byteorder='little')
+        is_auxpow = bool(version_int & (1 << 8))  # VERSION_AUXPOW
+        
+        if is_auxpow:
+            # FIXED: Return only basic header (80 bytes) for Electrum compatibility
+            # AuxPoW data is not needed for SPV validation
+            return block[:cls.BASIC_HEADER_SIZE]
+        else:
+            # For non-AuxPOW blocks, use static header length
+            header_size = cls.static_header_len(height)
+            return block[:header_size]
+
+
 class Coin:
     '''Base class of coin hierarchy.'''
 
@@ -206,9 +236,24 @@ class Coin:
     @classmethod
     def block(cls, raw_block, height):
         '''Return a Block namedtuple given a raw block and its height.'''
-        header = cls.block_header(raw_block, height)
-        txs = cls.DESERIALIZER(raw_block, start=len(header)).read_tx_block()
-        return Block(raw_block, header, txs)
+        # Check if this is an AuxPOW block first
+        version_int = int.from_bytes(raw_block[:4], byteorder='little')
+        is_auxpow = bool(version_int & (1 << 8))  # VERSION_AUXPOW
+        
+        if is_auxpow:
+            # CRITICAL FIX: Use AuxPOW deserializer for both header and transactions
+            # Regular deserializer can't handle AuxPoW block structure correctly
+            auxpow_deserializer = cls.DESERIALIZER(raw_block)
+            header = auxpow_deserializer.read_header(cls.BASIC_HEADER_SIZE)
+            # Now deserializer cursor is positioned correctly after AuxPoW data
+            txs = auxpow_deserializer.read_tx_block()
+            return Block(raw_block, header, txs)
+        else:
+            # Use regular deserializer for non-AuxPOW blocks
+            header_size = cls.static_header_len(height)
+            header = raw_block[:header_size]
+            txs = lib_tx.Deserializer(raw_block, start=header_size).read_tx_block()
+            return Block(raw_block, header, txs)
 
     @classmethod
     def decimal_value(cls, value):
@@ -254,7 +299,7 @@ class Ravencoin(Coin):
         '''Given a header height return its offset in the headers file.'''
         if cls.KAWPOW_ACTIVATION_HEIGHT < 0 or height < cls.KAWPOW_ACTIVATION_HEIGHT:
             return height * cls.BASIC_HEADER_SIZE
-        else:  # RVN block header size increased with kawpow fork
+        else:  # Block header size increased with kawpow fork
             return (cls.KAWPOW_ACTIVATION_HEIGHT * cls.BASIC_HEADER_SIZE) + ((height - cls.KAWPOW_ACTIVATION_HEIGHT) * cls.KAWPOW_HEADER_SIZE)
 
     @classmethod
@@ -272,7 +317,7 @@ class Ravencoin(Coin):
             return x16r_hash.getPoWHash(header)
         
 
-class Meowcoin(Coin):
+class Meowcoin(AuxPowMixin, Coin):
     NAME = "Meowcoin"
     SHORTNAME = "MEWC"
     NET = "mainnet"
@@ -284,10 +329,11 @@ class Meowcoin(Coin):
                     '02ebc775ea67a64602f354bdaa320f70')
     DEFAULT_MAX_SEND = 10_000_000
     X16RV2_ACTIVATION_TIME = 1569945600   # algo switch to x16rv2 at this timestamp
-    KAWPOW_ACTIVATION_TIME = 1662493564  # kawpow algo activation time
+    KAWPOW_ACTIVATION_TIME = 1662493424  # kawpow algo activation time
     MEOWPOW_ACTIVATION_TIME = 1710799200  # meowpow algo activation time
     KAWPOW_ACTIVATION_HEIGHT = 373
     KAWPOW_HEADER_SIZE = 120
+    AUXPOW_ACTIVATION_HEIGHT = 1614560  # AuxPOW activation height for mainnet
     
     CHAIN_SIZE = 1
     CHAIN_SIZE_HEIGHT = 1
@@ -296,33 +342,60 @@ class Meowcoin(Coin):
     RPC_PORT = 9766
     REORG_LIMIT = 60
     PEERS = []
+    
+    # AuxPOW constants
+    VERSION_AUXPOW = (1 << 8)  # AuxPOW flag bit
+
+    @classmethod
+    def is_auxpow_block(cls, version_int):
+        '''Check if block version indicates AuxPOW block'''
+        return bool(version_int & cls.VERSION_AUXPOW)
 
     @classmethod
     def static_header_offset(cls, height):
         '''Given a header height return its offset in the headers file.'''
         if cls.KAWPOW_ACTIVATION_HEIGHT < 0 or height < cls.KAWPOW_ACTIVATION_HEIGHT:
             return height * cls.BASIC_HEADER_SIZE
-        else:  # RVN block header size increased with kawpow fork
+        else:  # Block header size increased with kawpow fork
             return (cls.KAWPOW_ACTIVATION_HEIGHT * cls.BASIC_HEADER_SIZE) + ((height - cls.KAWPOW_ACTIVATION_HEIGHT) * cls.KAWPOW_HEADER_SIZE)
 
     @classmethod
     def header_hash(cls, header):
-        '''Given a header return the hash.'''
-        timestamp = util.unpack_le_uint32_from(header, 68)[0]
-        if timestamp >= cls.MEOWPOW_ACTIVATION_TIME:
+        '''Given a header return the hash - always use first 80 bytes for consistency.'''
+        # Extract version to check for AuxPOW
+        version_int = util.unpack_le_uint32_from(header, 0)[0]
+        
+        # FIXED: Always use first 80 bytes for consistency with truncated headers
+        basic_header = header[:80]
+        timestamp = util.unpack_le_uint32_from(basic_header, 68)[0]
+        
+        # CRITICAL FIX: AuxPoW blocks use Scrypt, regardless of timestamp
+        if cls.is_auxpow_block(version_int):
+            # AuxPoW blocks always use Scrypt-1024-1-1-256 on basic header (80 bytes)
+            # This matches CPureBlockHeader::GetHash() in Meowcoin source
+            import hashlib
+            try:
+                # Use hashlib.scrypt (available in Python 3.6+)
+                return hashlib.scrypt(basic_header, salt=basic_header, n=1024, r=1, p=1, dklen=32)
+            except AttributeError:
+                # Fallback if scrypt not available
+                return double_sha256(basic_header)
+        
+        # For non-AuxPoW blocks, algorithm selection based on timestamp
+        if len(header) >= cls.KAWPOW_HEADER_SIZE and timestamp >= cls.MEOWPOW_ACTIVATION_TIME:
             nNonce64 = util.unpack_le_uint64_from(header, 80)[0]  # uint64_t
             mix_hash = header[119:87:-1]  # uint256
-            header_hash = double_sha256(header[:80])[::-1]
+            header_hash = double_sha256(basic_header)[::-1]
             return meowpow.light_verify(header_hash, mix_hash, nNonce64)[::-1]
-        if timestamp >= cls.KAWPOW_ACTIVATION_TIME:
+        elif len(header) >= cls.KAWPOW_HEADER_SIZE and timestamp >= cls.KAWPOW_ACTIVATION_TIME:
             nNonce64 = util.unpack_le_uint64_from(header, 80)[0]  # uint64_t
             mix_hash = header[119:87:-1]  # uint256
-            header_hash = double_sha256(header[:80])[::-1]
+            header_hash = double_sha256(basic_header)[::-1]
             return kawpow.light_verify(header_hash, mix_hash, nNonce64)[::-1]
         elif timestamp >= cls.X16RV2_ACTIVATION_TIME:
-            return x16rv2_hash.getPoWHash(header)
+            return x16rv2_hash.getPoWHash(basic_header)
         else:
-            return x16r_hash.getPoWHash(header)
+            return x16r_hash.getPoWHash(basic_header)
 
 class RavencoinTestnet(Ravencoin):
     NET = "testnet"
@@ -345,3 +418,49 @@ class RavencoinTestnet(Ravencoin):
     PEERS = [
         "rvn4lyfe.com t50011 s50012",
     ]
+
+
+class MeowcoinTestnet(Meowcoin):
+    NET = "testnet"
+    XPUB_VERBYTES = bytes.fromhex("043587CF")
+    XPRV_VERBYTES = bytes.fromhex("04358394")
+    P2PKH_VERBYTE = bytes.fromhex("6D")
+    P2SH_VERBYTES = [bytes.fromhex("7C")]
+    WIF_BYTE = bytes.fromhex("72")
+    GENESIS_HASH = ('000000eaab417d6dfe9bd75119972e1d0'
+                    '7ecfe8ff655bef7c2acb3d9a0eeed81')  # Meowcoin testnet genesis
+    X16RV2_ACTIVATION_TIME = 1567533600
+    KAWPOW_ACTIVATION_HEIGHT = 1  # MeowPow starts at block 1 in testnet  
+    KAWPOW_ACTIVATION_TIME = 1661833868  # KawPow activation time for testnet
+    MEOWPOW_ACTIVATION_TIME = 1707354000  # MeowPow activation time for testnet
+    AUXPOW_ACTIVATION_HEIGHT = 46  # AuxPOW activation at block 181 on testnet
+    
+    CHAIN_SIZE = 567_294_883
+    CHAIN_SIZE_HEIGHT = 1_048_377
+    AVG_BLOCK_SIZE = 400
+
+    RPC_PORT = 4568  # Testnet RPC port from config
+    PEERS = []
+
+
+class MeowcoinRegtest(Meowcoin):
+    NET = "regtest"
+    XPUB_VERBYTES = bytes.fromhex("043587CF")
+    XPRV_VERBYTES = bytes.fromhex("04358394")
+    P2PKH_VERBYTE = bytes.fromhex("6F")
+    P2SH_VERBYTES = [bytes.fromhex("C4")]
+    WIF_BYTE = bytes.fromhex("EF")
+    GENESIS_HASH = ('530827f38f93b43ed12af0b3ad25a288'
+                    'dc02ed74d6d7857862df51fc56c416f9')  # Regtest genesis
+    X16RV2_ACTIVATION_TIME = 1569931200  # X16RV2 activation time for regtest
+    KAWPOW_ACTIVATION_HEIGHT = 1  # MeowPow starts at block 1 in regtest
+    KAWPOW_ACTIVATION_TIME = 3582830167  # KawPow activation time for regtest (far future)
+    MEOWPOW_ACTIVATION_TIME = 3582830167  # MeowPow activation time for regtest (far future)
+    AUXPOW_ACTIVATION_HEIGHT = 19200  # AuxPOW activation at block 19200 on regtest
+    
+    CHAIN_SIZE = 1000000
+    CHAIN_SIZE_HEIGHT = 10000
+    AVG_BLOCK_SIZE = 400
+
+    RPC_PORT = 19766  # Regtest RPC port
+    PEERS = []

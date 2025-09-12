@@ -116,6 +116,85 @@ class Deserializer:
         value, self.cursor = read_varint(self.view, self.cursor)
         return value
 
+    def _read_nbytes(self, size):
+        '''Read and return exactly n bytes.'''
+        end = self.cursor + size
+        if end > len(self.view):
+            raise ValueError(f'not enough data: cursor={self.cursor}, size={size}, view_len={len(self.view)}')
+        result = bytes(self.view[self.cursor:end])
+        self.cursor = end
+        return result
+
+    def _read_le_uint32(self):
+        '''Read and return a little-endian uint32.'''
+        result, = unpack_le_uint32_from(self.view, self.cursor)
+        self.cursor += 4
+        return result
+
+    def _read_varint(self):
+        '''Read and return a varint.'''
+        result, self.cursor = read_varint(self.view, self.cursor)
+        return result
+
+    def read_tx_block(self):
+        '''Read and return all transactions in the block.'''
+        read = self.read_tx
+        return [read() for _ in range(self._read_varint())]
+
+
+class DeserializerAuxPow(Deserializer):
+    '''Deserializer for AuxPOW blocks.'''
+    
+    VERSION_AUXPOW = (1 << 8)
+
+    def read_auxpow(self):
+        '''Reads and returns the CAuxPow data'''
+        
+        # We first calculate the size of the CAuxPow instance and then
+        # read it as bytes in the final step.
+        start = self.cursor
+
+        self.read_tx()  # AuxPow transaction
+        self.cursor += 32  # Parent block hash
+        merkle_size = self._read_varint()
+        self.cursor += 32 * merkle_size  # Merkle branch
+        self.cursor += 4  # Index
+        merkle_size = self._read_varint()
+        self.cursor += 32 * merkle_size  # Chain merkle branch
+        self.cursor += 4  # Chain index
+        self.cursor += 80  # Parent block header
+
+        end = self.cursor
+        self.cursor = start
+        return self._read_nbytes(end - start)
+
+    def read_header(self, static_header_size):
+        '''Return ONLY basic header for Electrum compatibility'''
+        
+        start = self.cursor
+        version = self._read_le_uint32()
+        
+        if version & self.VERSION_AUXPOW:
+            # FIXED: For AuxPoW, return only basic header (80 bytes) for compatibility
+            # AuxPoW data is not needed for SPV validation
+            self.cursor = start
+            basic_header = self._read_nbytes(static_header_size)
+            
+            # Advance cursor past AuxPoW data for future reads
+            self.cursor = start + static_header_size
+            self.read_auxpow()  # Skip AuxPoW data
+            
+            return basic_header
+        else:
+            # For normal headers
+            self.cursor = start
+            return self._read_nbytes(static_header_size)
+
+    def read_tx_block(self):
+        '''Read and return all transactions in the block.'''
+        read = self.read_tx
+        return [read() for _ in range(self._read_varint())]
+
 
 def read_varint(buf, cursor):
     n = buf[cursor]
