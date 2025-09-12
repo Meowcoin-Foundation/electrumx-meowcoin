@@ -645,7 +645,12 @@ class BlockProcessor:
 
             OnDiskBlock.log_block = True
             if hist_cache_size:
-                logger.info(f'UTXOs {utxo_MB:,d}MB Assets {asset_MB:,d}MB hist {hist_MB:,d}MB')
+                # Include height information - use current processing height
+                # During sync, db.state.height is not updated until flush, so add processed blocks
+                our_height = self.db.state.height + len(self.headers)
+                daemon_height = self.daemon.cached_height()
+                logger.info(f'our height: {our_height:,d} daemon: {daemon_height:,d} '
+                          f'UTXOs {utxo_MB:,d}MB Assets {asset_MB:,d}MB hist {hist_MB:,d}MB')
 
             # Flush history if it takes up over 20% of cache memory.
             # Flush UTXOs once they take up 80% of cache memory.
