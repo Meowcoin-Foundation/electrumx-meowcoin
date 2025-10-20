@@ -797,12 +797,81 @@ class DB:
         self.fs_h160_count = h160_count
         # Truncate header_mc: header count is 1 more than the height.
         self.header_mc.truncate(height + 1)
+    
+    def _unpad_auxpow_header(self, header, height):
+        '''Remove padding from AuxPOW headers before sending to clients.
+        
+        AuxPOW headers are stored as 120 bytes (80 + 40 padding) to maintain
+        static offsets, but clients expect 80 bytes for AuxPOW blocks.
+        '''
+        # Only process if AuxPOW is potentially active at this height
+        if not self.coin.is_auxpow_active(height):
+            return header
+        
+        # Check if this is an AuxPOW header (version bit set)
+        if len(header) >= 4:
+            version_int = int.from_bytes(header[:4], byteorder='little')
+            if version_int & (1 << 8):  # AuxPOW version bit
+                # Return only first 80 bytes, remove padding
+                return header[:80]
+        
+        return header
+    
+    def _unpad_auxpow_headers(self, headers, start_height):
+        '''Remove padding from multiple concatenated AuxPOW headers.
+        
+        CRITICAL FIX: Process headers sequentially, maintaining correct alignment
+        when mixing AuxPOW (80 bytes) and MeowPow (120 bytes) headers.
+        '''
+        result = b''
+        p = 0
+        h = start_height
+        processed_count = 0
+        
+        # DEBUG: Log input data for chunk requests around problematic height
+        if start_height == 1620864:
+            self.logger.info(f'DEBUG: Processing chunk from height {start_height}')
+            self.logger.info(f'DEBUG: Input headers length: {len(headers)} bytes')
+            self.logger.info(f'DEBUG: Expected: 2016 headers * 120 bytes = {2016 * 120} bytes')
+        
+        while p < len(headers):
+            # Each header in file is 120 bytes (after KAWPOW activation)
+            if h >= self.coin.KAWPOW_ACTIVATION_HEIGHT:
+                header_in_file = headers[p:p + 120]
+                expected_size = 120
+                p += 120
+            else:
+                header_in_file = headers[p:p + 80]
+                expected_size = 80
+                p += 80
+            
+            # Check if we have enough data
+            if len(header_in_file) < expected_size:
+                if start_height == 1620864:
+                    self.logger.info(f'DEBUG: Premature end at header {processed_count}, height {h}')
+                    self.logger.info(f'DEBUG: Got {len(header_in_file)} bytes, expected {expected_size}')
+                break
+                
+            # Unpad if needed - this will return 80 bytes for AuxPOW, 120 for others
+            header_to_send = self._unpad_auxpow_header(header_in_file, h)
+            result += header_to_send
+            h += 1
+            processed_count += 1
+        
+        # DEBUG: Log final results
+        if start_height == 1620864:
+            self.logger.info(f'DEBUG: Processed {processed_count} headers')
+            self.logger.info(f'DEBUG: Result length: {len(result)} bytes')
+            self.logger.info(f'DEBUG: Average header size: {len(result) / processed_count if processed_count > 0 else 0:.1f} bytes')
+        
+        return result
 
     async def raw_header(self, height):
         '''Return the binary header at the given height.'''
         header, n = await self.read_headers(height, 1)
         if n != 1:
             raise IndexError(f'height {height:,d} out of range')
+        # Note: read_headers() already removes padding via _unpad_auxpow_headers
         return header
 
     async def read_headers(self, start_height, count):
@@ -812,6 +881,8 @@ class DB:
 
         Returns a (binary, n) pair where binary is the concatenated binary headers, and n
         is the count of headers returned.
+        
+        Note: AuxPOW headers are stored padded to 120 bytes but returned as 80 bytes for client compatibility.
         '''
         if start_height < 0 or count < 0:
             raise self.DBError(f'{count:,d} headers starting at '
@@ -820,10 +891,23 @@ class DB:
         def read_headers():
             # Read some from disk
             disk_count = max(0, min(count, self.state.height + 1 - start_height))
+            
+            # DEBUG: Log for problematic chunk
+            if start_height == 1620864:
+                self.logger.info(f'DEBUG read_headers: start_height={start_height}, requested_count={count}')
+                self.logger.info(f'DEBUG read_headers: state.height={self.state.height}')
+                self.logger.info(f'DEBUG read_headers: disk_count={disk_count}')
+            
             if disk_count:
                 offset = self.header_offset(start_height)
                 size = self.header_offset(start_height + disk_count) - offset
-                return self.headers_file.read(offset, size), disk_count
+                
+                headers_from_disk = self.headers_file.read(offset, size)
+                
+                # Remove padding from AuxPOW headers before returning
+                headers_unpadded = self._unpad_auxpow_headers(headers_from_disk, start_height)
+                
+                return headers_unpadded, disk_count
             return b'', 0
 
         return await run_in_thread(read_headers)
@@ -866,7 +950,18 @@ class DB:
         offset = 0
         headers = []
         for n in range(count):
-            hlen = self.header_len(height + n)
+            h = height + n
+            # Determine actual header length (unpadded) for splitting
+            # After reading, AuxPOW headers are 80 bytes, others use static_header_len
+            if self.coin.is_auxpow_active(h) and len(headers_concat) >= offset + 4:
+                version_int = int.from_bytes(headers_concat[offset:offset+4], byteorder='little')
+                if version_int & (1 << 8):  # AuxPOW block
+                    hlen = 80
+                else:
+                    hlen = self.header_len(h)
+            else:
+                hlen = self.header_len(h)
+            
             headers.append(headers_concat[offset:offset + hlen])
             offset += hlen
 

@@ -118,6 +118,7 @@ class OnDiskBlock:
         self.size = size
         self.block_file = None
         self.header = None
+        self.header_end_offset = None  # Position after header where transactions start
 
     @classmethod
     def filename(cls, hex_hash, height):
@@ -125,7 +126,75 @@ class OnDiskBlock:
 
     def __enter__(self):
         self.block_file = open_file(self.filename(self.hex_hash, self.height))
-        self.header = self._read(self.coin.static_header_len(self.height))
+        
+        # CRITICAL FIX: After AuxPOW activation, blocks can be:
+        # 1. Mined directly (MeowPow): version bit set, but NO AuxPOW structure
+        # 2. Merge-mined (Scrypt): version bit set AND has AuxPOW structure
+        # The version bit only indicates AuxPOW is enabled, not that this specific block has it
+        if self.coin.is_auxpow_active(self.height):
+            try:
+                # Peek at version to check version bit
+                peek_data = self.block_file.read(4)
+                if len(peek_data) < 4:
+                    raise RuntimeError(f'Cannot read version from block {self.hex_hash}')
+                self.block_file.seek(0)
+                version_int = int.from_bytes(peek_data[:4], byteorder='little')
+                
+                if version_int & (1 << 8):  # AuxPOW version bit is set
+                    # Check if block actually has AuxPOW structure by examining byte after header
+                    self.block_file.seek(80)  # Position after basic header
+                    first_tx_byte = self.block_file.read(1)
+                    
+                    if not first_tx_byte or len(first_tx_byte) < 1:
+                        # Cannot read byte 80, fall through to pre-AuxPOW path
+                        self.block_file.seek(0)
+                    else:
+                        self.block_file.seek(0)  # Reset to start
+                        
+                        # Heuristic to detect AuxPOW structure:
+                        # - MeowPow direct: byte 80 is tx_count varint (typically 1-50)
+                        # - AuxPOW merge: byte 80 is start of coinbase tx version (0x01 or 0x02)
+                        # Most blocks have < 100 txs, so varint < 100
+                        # Coinbase tx version is always 0x01 or 0x02
+                        has_auxpow_structure = first_tx_byte and first_tx_byte[0] <= 2
+                        
+                        if has_auxpow_structure:
+                            # Block has AuxPOW structure - use AuxPOW deserializer
+                            from electrumx.lib.tx import DeserializerAuxPow
+                            peek_size = min(50000, self.size)
+                            raw_block_peek = self.block_file.read(peek_size)
+                            
+                            if len(raw_block_peek) < peek_size:
+                                # Block file is smaller than expected, read what we got
+                                pass
+                            
+                            deserializer = DeserializerAuxPow(raw_block_peek)
+                            self.header = deserializer.read_header(self.coin.BASIC_HEADER_SIZE, self.height)
+                            # Now cursor is positioned after AuxPOW data
+                            header_end_offset = deserializer.cursor
+                            
+                            if header_end_offset > self.size:
+                                raise RuntimeError(f'AuxPOW header parsing error: cursor {header_end_offset} exceeds block size {self.size}')
+                            
+                            self.header_end_offset = header_end_offset
+                            self.block_file.seek(header_end_offset)
+                            return self
+                        else:
+                            # MeowPow direct block with AuxPOW bit set but no AuxPOW structure
+                            # According to Meowcoin code: if nVersion.IsAuxpow() then header is 80 bytes
+                            # (includes nNonce but not nHeight/nNonce64/mix_hash)
+                            self.block_file.seek(0)
+                            self.header = self._read(80)
+                            self.header_end_offset = 80
+                            return self
+            except Exception:
+                # Exception in AuxPOW detection, reset file position and fall through to pre-AuxPOW path
+                self.block_file.seek(0)
+        
+        # For blocks before AuxPOW activation, use static header length
+        header_len = self.coin.static_header_len(self.height)
+        self.header = self._read(header_len)
+        self.header_end_offset = header_len
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -133,8 +202,10 @@ class OnDiskBlock:
 
     def _read(self, size):
         result = self.block_file.read(size)
-        if not result:
-            raise RuntimeError(f'truncated block file for block {self.hex_hash} '
+        # Allow EOF (empty result) when we've already read some data
+        # Only raise error if file is completely empty from the start
+        if not result and self.block_file.tell() == 0:
+            raise RuntimeError(f'empty block file for block {self.hex_hash} '
                                f'height {self.height:,d}')
         return result
 
@@ -183,8 +254,15 @@ class OnDiskBlock:
     def _chunk_offsets(self):
         '''Iterate the transactions forwards to find their boundaries.'''
         base_offset = self.block_file.tell()
-        assert base_offset in (80, 120)
+        # CRITICAL FIX: For AuxPOW blocks, cursor can be at variable positions
+        # Don't assert fixed offsets - the __enter__ method positions correctly
+        # Just verify we're past the header (at least 80 bytes)
+        if base_offset < 80:
+            raise RuntimeError(f'Invalid base_offset {base_offset} - must be at least 80 (after header)')
         raw = self._read(self.chunk_size)
+        if not raw:
+            raise RuntimeError(f'No transaction data after header at offset {base_offset} '
+                               f'for block {self.hex_hash} height {self.height:,d} size {self.size}')
         deserializer = Deserializer(raw)
         tx_count = deserializer.read_varint()
         logger.info(f'backing up block {self.hex_hash} height {self.height:,d} '
@@ -209,6 +287,9 @@ class OnDiskBlock:
             if tx_count == 0:
                 return offsets
             raw = raw[cursor:] + self._read(self.chunk_size)
+            if not raw:
+                raise RuntimeError(f'Incomplete block data: {tx_count} transactions remaining '
+                                   f'for block {self.hex_hash} height {self.height:,d}')
             deserializer = Deserializer(raw)
 
     def iter_txs_reversed(self):
@@ -342,7 +423,7 @@ class BlockProcessor:
     up in case of chain reorganisations.
     '''
 
-    polling_delay = 5
+    polling_delay = 3  # Reduced from 5 to 3 for faster block detection
 
     def __init__(self, env: Env, db: DB, daemon: Daemon, notifications):
         self.env = env
@@ -654,8 +735,73 @@ class BlockProcessor:
 
             # Flush history if it takes up over 20% of cache memory.
             # Flush UTXOs once they take up 80% of cache memory.
-            if asset_MB + utxo_MB + hist_MB >= cache_MB or hist_MB >= cache_MB // 5:
-                self.force_flush_arg = (utxo_MB + asset_MB) >= cache_MB * 4 // 5
+            # When caught up, also flush every 5 blocks to ensure timely client notifications
+            blocks_pending = len(self.headers)
+            
+            # DIAGNOSTIC: Check flush criteria
+            cache_full = asset_MB + utxo_MB + hist_MB >= cache_MB
+            hist_full = hist_MB >= cache_MB // 5
+            blocks_ready = self.caught_up and blocks_pending >= 5
+            
+            should_flush = cache_full or hist_full or blocks_ready
+            
+            # DIAGNOSTIC: Always log status every 30s
+            logger.info(f'CHECK_CACHE: should_flush={should_flush} | '
+                       f'cache_full={cache_full}({asset_MB + utxo_MB + hist_MB}>={cache_MB}) '
+                       f'hist_full={hist_full}({hist_MB}>={cache_MB // 5}) '
+                       f'blocks_ready={blocks_ready}(caught_up={self.caught_up} blocks={blocks_pending}>=5) | '
+                       f'CACHE_MB={cache_MB}')
+            
+            if should_flush:
+                # Log the reason(s) for triggering flush
+                reasons = []
+                if cache_full:
+                    reasons.append(f'cache_full({asset_MB + utxo_MB + hist_MB}MB >= {cache_MB}MB)')
+                if hist_full:
+                    reasons.append(f'hist_full({hist_MB}MB >= {cache_MB // 5}MB)')
+                if blocks_ready:
+                    reasons.append(f'blocks_ready({blocks_pending} >= 5)')
+                
+                logger.info(f'FLUSH TRIGGER: {", ".join(reasons)} | '
+                           f'UTXO={utxo_MB}MB Asset={asset_MB}MB Hist={hist_MB}MB | '
+                           f'blocks_pending={blocks_pending} caught_up={self.caught_up} height={self.state.height + blocks_pending}')
+                
+                flush_utxos = (utxo_MB + asset_MB) >= cache_MB * 4 // 5
+                
+                # CRITICAL FIX: If blocks_ready, flush immediately instead of waiting for new blocks
+                # This ensures timely updates to clients when caught up
+                if blocks_ready:
+                    logger.info(f'FLUSHING IMMEDIATELY: {blocks_pending} blocks ready, caught_up={self.caught_up}')
+                    await self.run_with_lock(self.flush(flush_utxos))
+                    
+                    # Notify clients immediately after flush
+                    if self.caught_up:
+                        await self.notifications.notify(
+                            self.state.height,
+                            self.touched,
+                            self.asset_touched,
+                            self.qualifier_touched,
+                            self.h160_touched,
+                            self.broadcast_touched,
+                            self.frozen_touched,
+                            self.validator_touched,
+                            self.qualifier_association_touched
+                        )
+                        # Clear touched sets after notification
+                        self.touched = set()
+                        self.asset_touched = set()
+                        self.qualifier_touched = set()
+                        self.h160_touched = set()
+                        self.broadcast_touched = set()
+                        self.frozen_touched = set()
+                        self.validator_touched = set()
+                        self.qualifier_association_touched = set()
+                    
+                    logger.info(f'IMMEDIATE FLUSH COMPLETE: height={self.state.height}, clients notified')
+                else:
+                    # For cache/hist flushes, use the normal flow via force_flush_arg
+                    self.force_flush_arg = flush_utxos
+            
             await sleep(30)
 
     async def advance_blocks(self, hex_hashes):
@@ -664,7 +810,31 @@ class BlockProcessor:
         async def advance_and_maybe_flush(block):
             await run_in_thread(self.advance_block, block)
             if self.force_flush_arg is not None:
+                # DIAGNOSTIC: Log when flush actually executes
+                blocks_processed = len(self.headers)
+                logger.info(f'FLUSH EXECUTING: height={self.state.height} blocks_in_queue={blocks_processed} '
+                           f'force_flush_arg={self.force_flush_arg} caught_up={self.caught_up}')
                 await self.flush(self.force_flush_arg)
+                
+                # When caught up, notify clients immediately after flush
+                # This ensures clients receive updates within ~5 minutes instead of hours
+                if self.caught_up:
+                    await self.notifications.on_block(
+                        self.touched, self.state.height,
+                        self.asset_touched, self.qualifier_touched,
+                        self.h160_touched, self.broadcast_touched,
+                        self.frozen_touched, self.validator_touched,
+                        self.qualifier_association_touched
+                    )
+                    # Clear touched sets after notification
+                    self.touched = set()
+                    self.asset_touched = set()
+                    self.qualifier_touched = set()
+                    self.h160_touched = set()
+                    self.broadcast_touched = set()
+                    self.frozen_touched = set()
+                    self.validator_touched = set()
+                    self.qualifier_association_touched = set()
 
         for hex_hash in hex_hashes:
             # Stop if we must flush
@@ -782,20 +952,17 @@ class BlockProcessor:
         utxo_count_delta = 0
 
         with block as raw_block:
-            # Read the complete raw block data
-            raw_block.block_file.seek(0)
-            complete_raw_block = raw_block.block_file.read()
+            # Header is already correctly parsed in __enter__ for both MeowPow and AuxPOW blocks
+            # No need to re-read the entire block - just validate prevhash and iterate transactions
             
-            # Parse the block using the coin's deserializer
-            parsed_block = self.coin.block(complete_raw_block, raw_block.height)
-            
-            if self.coin.header_prevhash(parsed_block.header) != self.state.tip:
+            if self.coin.header_prevhash(block.header) != self.state.tip:
                 self.reorg_count = -1
                 return
             
             self.ok = False
-            for tx in parsed_block.transactions:
-                tx_hash = tx.txid if hasattr(tx, 'txid') else double_sha256(tx.serialize())
+            # iter_txs() reads transactions from current file cursor (after header)
+            # This avoids re-reading the entire block that was already read in __enter__
+            for tx, tx_hash in block.iter_txs():
                 hashXs = []
                 inputHashXs = defaultdict(set)
                 append_hashX = hashXs.append
@@ -1288,7 +1455,13 @@ class BlockProcessor:
             self.verifier_history_undos.append((internal_verifier_history_undo_info, block.height))
             self.associations_undos.append((internal_association_undo_info, block.height))
             self.association_history_undos.append((internal_association_history_undo_info, block.height))
-        self.headers.append(block.header)
+        
+        # CRITICAL: Pad AuxPOW headers to 120 bytes for storage to maintain static offsets
+        header_to_store = block.header
+        if (self.coin.is_auxpow_active(block.height) and len(block.header) == 80):
+            # AuxPOW header (80 bytes) - pad to 120 for consistent disk storage
+            header_to_store = block.header + bytes(40)
+        self.headers.append(header_to_store)
         
         #Update State
         state.height = block.height
@@ -1461,7 +1634,22 @@ class BlockProcessor:
 
         count = 0
         utxo_count_delta = 0
-        with block as block:
+        with block as raw_block:
+            # Read the complete raw block data to parse header correctly
+            raw_block.block_file.seek(0)
+            complete_raw_block = raw_block.block_file.read()
+            
+            # Parse the block to get the correctly formatted header
+            # This is crucial for AuxPOW blocks where header size may differ from static size
+            parsed_block = self.coin.block(complete_raw_block, raw_block.height)
+            block.header = parsed_block.header
+            
+            # CRITICAL FIX: Reset file cursor to position after header
+            # backup_block reads entire file which moves cursor to EOF
+            # but iter_txs_reversed needs cursor at start of transactions
+            if raw_block.header_end_offset is not None:
+                raw_block.block_file.seek(raw_block.header_end_offset)
+            
             self.ok = False
             for tx, tx_hash in block.iter_txs_reversed():
                 for idx, txout in enumerate(tx.outputs):
