@@ -660,6 +660,9 @@ class BlockProcessor:
         )
     async def flush(self, flush_utxos):
         self.force_flush_arg = None
+        # Skip flush if no new blocks (prevents double flush)
+        if not self.headers:
+            return
         # Estimate size remaining
         daemon_height = self.daemon.cached_height()
         tail_blocks = max(0, (daemon_height - max(self.state.height, self.coin.CHAIN_SIZE_HEIGHT)))
@@ -727,64 +730,77 @@ class BlockProcessor:
             OnDiskBlock.log_block = True
             if hist_cache_size:
                 # Include height information - use current processing height
-                # During sync, db.state.height is not updated until flush, so add processed blocks
-                our_height = self.db.state.height + len(self.headers)
+                # Use self.state.height which is updated immediately after block processing
+                our_height = self.state.height
                 daemon_height = self.daemon.cached_height()
                 logger.info(f'our height: {our_height:,d} daemon: {daemon_height:,d} '
                           f'UTXOs {utxo_MB:,d}MB Assets {asset_MB:,d}MB hist {hist_MB:,d}MB')
 
             # Flush history if it takes up over 20% of cache memory.
             # Flush UTXOs once they take up 80% of cache memory.
-            # When caught up, also flush every 5 blocks to ensure timely client notifications
+            # When caught up, flush every block to ensure immediate client availability
             blocks_pending = len(self.headers)
             
-            # DIAGNOSTIC: Check flush criteria
             cache_full = asset_MB + utxo_MB + hist_MB >= cache_MB
             hist_full = hist_MB >= cache_MB // 5
-            blocks_ready = self.caught_up and blocks_pending >= 5
+            blocks_ready = self.caught_up and blocks_pending >= 1
             
             should_flush = cache_full or hist_full or blocks_ready
             
-            # DIAGNOSTIC: Always log status every 30s
-            logger.info(f'CHECK_CACHE: should_flush={should_flush} | '
-                       f'cache_full={cache_full}({asset_MB + utxo_MB + hist_MB}>={cache_MB}) '
-                       f'hist_full={hist_full}({hist_MB}>={cache_MB // 5}) '
-                       f'blocks_ready={blocks_ready}(caught_up={self.caught_up} blocks={blocks_pending}>=5) | '
-                       f'CACHE_MB={cache_MB}')
-            
             if should_flush:
-                # Log the reason(s) for triggering flush
-                reasons = []
-                if cache_full:
-                    reasons.append(f'cache_full({asset_MB + utxo_MB + hist_MB}MB >= {cache_MB}MB)')
-                if hist_full:
-                    reasons.append(f'hist_full({hist_MB}MB >= {cache_MB // 5}MB)')
-                if blocks_ready:
-                    reasons.append(f'blocks_ready({blocks_pending} >= 5)')
-                
-                logger.info(f'FLUSH TRIGGER: {", ".join(reasons)} | '
-                           f'UTXO={utxo_MB}MB Asset={asset_MB}MB Hist={hist_MB}MB | '
-                           f'blocks_pending={blocks_pending} caught_up={self.caught_up} height={self.state.height + blocks_pending}')
-                
                 flush_utxos = (utxo_MB + asset_MB) >= cache_MB * 4 // 5
                 
-                # CRITICAL FIX: If blocks_ready, flush immediately instead of waiting for new blocks
-                # This ensures timely updates to clients when caught up
+                # If blocks_ready, flush immediately for timely client updates
                 if blocks_ready:
-                    logger.info(f'FLUSHING IMMEDIATELY: {blocks_pending} blocks ready, caught_up={self.caught_up}')
-                    await self.run_with_lock(self.flush(flush_utxos))
+                    # Double-check headers exist (avoid race condition with empty flush)
+                    if self.headers:
+                        await self.run_with_lock(self.flush(flush_utxos))
+                        
+                        # Notify clients directly after flush
+                        if self.caught_up and self.notifications.notify:
+                            await self.notifications.notify(
+                                self.state.height,
+                                self.touched,
+                                self.asset_touched,
+                                self.qualifier_touched,
+                                self.h160_touched,
+                                self.broadcast_touched,
+                                self.frozen_touched,
+                                self.validator_touched,
+                                self.qualifier_association_touched
+                            )
+                            # Clear touched sets after notification
+                            self.touched = set()
+                            self.asset_touched = set()
+                            self.qualifier_touched = set()
+                            self.h160_touched = set()
+                            self.broadcast_touched = set()
+                            self.frozen_touched = set()
+                            self.validator_touched = set()
+                            self.qualifier_association_touched = set()
+                else:
+                    # For cache/hist flushes, use the normal flow via force_flush_arg
+                    self.force_flush_arg = flush_utxos
+            
+            await sleep(5)
+
+    async def advance_blocks(self, hex_hashes):
+        '''Process the blocks passed.  Detects and handles reorgs.'''
+
+        async def advance_and_maybe_flush(block):
+            await run_in_thread(self.advance_block, block)
+            if self.force_flush_arg is not None:
+                # Only flush if there are pending blocks (avoid empty flush)
+                if self.headers:
+                    await self.flush(self.force_flush_arg)
                     
-                    # Notify clients immediately after flush
+                    # When caught up, notify clients immediately after flush
                     if self.caught_up:
-                        await self.notifications.notify(
-                            self.state.height,
-                            self.touched,
-                            self.asset_touched,
-                            self.qualifier_touched,
-                            self.h160_touched,
-                            self.broadcast_touched,
-                            self.frozen_touched,
-                            self.validator_touched,
+                        await self.notifications.on_block(
+                            self.touched, self.state.height,
+                            self.asset_touched, self.qualifier_touched,
+                            self.h160_touched, self.broadcast_touched,
+                            self.frozen_touched, self.validator_touched,
                             self.qualifier_association_touched
                         )
                         # Clear touched sets after notification
@@ -796,45 +812,8 @@ class BlockProcessor:
                         self.frozen_touched = set()
                         self.validator_touched = set()
                         self.qualifier_association_touched = set()
-                    
-                    logger.info(f'IMMEDIATE FLUSH COMPLETE: height={self.state.height}, clients notified')
-                else:
-                    # For cache/hist flushes, use the normal flow via force_flush_arg
-                    self.force_flush_arg = flush_utxos
-            
-            await sleep(30)
-
-    async def advance_blocks(self, hex_hashes):
-        '''Process the blocks passed.  Detects and handles reorgs.'''
-
-        async def advance_and_maybe_flush(block):
-            await run_in_thread(self.advance_block, block)
-            if self.force_flush_arg is not None:
-                # DIAGNOSTIC: Log when flush actually executes
-                blocks_processed = len(self.headers)
-                logger.info(f'FLUSH EXECUTING: height={self.state.height} blocks_in_queue={blocks_processed} '
-                           f'force_flush_arg={self.force_flush_arg} caught_up={self.caught_up}')
-                await self.flush(self.force_flush_arg)
-                
-                # When caught up, notify clients immediately after flush
-                # This ensures clients receive updates within ~5 minutes instead of hours
-                if self.caught_up:
-                    await self.notifications.on_block(
-                        self.touched, self.state.height,
-                        self.asset_touched, self.qualifier_touched,
-                        self.h160_touched, self.broadcast_touched,
-                        self.frozen_touched, self.validator_touched,
-                        self.qualifier_association_touched
-                    )
-                    # Clear touched sets after notification
-                    self.touched = set()
-                    self.asset_touched = set()
-                    self.qualifier_touched = set()
-                    self.h160_touched = set()
-                    self.broadcast_touched = set()
-                    self.frozen_touched = set()
-                    self.validator_touched = set()
-                    self.qualifier_association_touched = set()
+                # Reset force_flush_arg even if we didn't flush
+                self.force_flush_arg = None
 
         for hex_hash in hex_hashes:
             # Stop if we must flush
@@ -1847,21 +1826,11 @@ class BlockProcessor:
     async def on_caught_up(self):
         was_first_sync = self.state.first_sync
         self.state.first_sync = False
-        await self.flush(True)
-        if self.caught_up:
-            # Flush everything before notifying as client queries are performed on the DB
-            await self.notifications.on_block(self.touched, self.state.height, self.asset_touched,
-                                              self.qualifier_touched, self.h160_touched, self.broadcast_touched,
-                                              self.frozen_touched, self.validator_touched, self.qualifier_association_touched)
-            self.touched = set()
-            self.asset_touched = set()
-            self.qualifier_touched = set()
-            self.h160_touched = set()
-            self.broadcast_touched = set()
-            self.frozen_touched = set()
-            self.validator_touched = set()
-            self.qualifier_association_touched = set()
-        else:
+        # Only flush if NOT caught_up yet (first sync) or has pending blocks
+        # When caught_up, check_cache_size_loop handles all flushing
+        if not self.caught_up and self.headers:
+            await self.flush(True)
+        if not self.caught_up:
             self.caught_up = True
             if was_first_sync:
                 logger.info(f'{electrumx.version} synced to height {self.state.height:,d}')
