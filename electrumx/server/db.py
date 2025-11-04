@@ -333,6 +333,9 @@ class DB:
         
         self.asset_db: Storage = None
         self.suid_db: Storage = None
+        
+        # Reference to BlockProcessor for cache lookup (set by Controller)
+        self.bp = None
 
         self.logger.info(f'using {self.env.db_engine} for DB backend')
 
@@ -540,9 +543,12 @@ class DB:
         flush_data.state.flush_time = end_time
         flush_data.state.sync_time += flush_interval
 
-        # Update and flush state again so as not to drop the batch commit time
+        # CRITICAL: Always update db.state after flush so clients see correct height
+        # Sessions use db.state.height in _refresh_hsub_results (line 384 of session.py)
+        self.state = flush_data.state.copy()
+        
+        # Write UTXO state to disk only when doing full UTXO flush
         if flush_utxos:
-            self.state = flush_data.state.copy()
             self.write_utxo_state(self.utxo_db)
 
         size_delta = self.log_flush_stats('flush', flush_data, elapsed)
@@ -797,12 +803,73 @@ class DB:
         self.fs_h160_count = h160_count
         # Truncate header_mc: header count is 1 more than the height.
         self.header_mc.truncate(height + 1)
+    
+    def _unpad_auxpow_header(self, header, height):
+        '''Remove padding from AuxPOW headers before sending to clients.
+        
+        AuxPOW headers are stored as 120 bytes (80 + 40 padding) to maintain
+        static offsets, but clients expect 80 bytes for AuxPOW blocks.
+        '''
+        # Only process if AuxPOW is potentially active at this height
+        if not self.coin.is_auxpow_active(height):
+            return header
+        
+        # Check if this is an AuxPOW header (version bit set)
+        if len(header) >= 4:
+            version_int = int.from_bytes(header[:4], byteorder='little')
+            if version_int & (1 << 8):  # AuxPOW version bit
+                # Return only first 80 bytes, remove padding
+                return header[:80]
+        
+        return header
+    
+    def _unpad_auxpow_headers(self, headers, start_height):
+        '''Remove padding from multiple concatenated headers before sending to clients.
+        
+        Header storage format:
+        - Before KAWPOW_ACTIVATION_HEIGHT (373): 80 bytes per header
+        - After KAWPOW_ACTIVATION_HEIGHT: 120 bytes per header (for consistent offsets)
+          * MeowPow blocks: naturally 120 bytes
+          * AuxPOW blocks: 80 bytes basic header + 40 bytes padding
+        
+        This function reads headers from disk (all 120 bytes after KAWPOW activation)
+        and removes padding from AuxPOW headers (returns 80 bytes) before sending to clients.
+        MeowPow headers are returned as-is (120 bytes).
+        '''
+        result = b''
+        p = 0
+        h = start_height
+        processed_count = 0
+        
+        while p < len(headers):
+            # Each header in file is 120 bytes (after KAWPOW activation)
+            if h >= self.coin.KAWPOW_ACTIVATION_HEIGHT:
+                header_in_file = headers[p:p + 120]
+                expected_size = 120
+                p += 120
+            else:
+                header_in_file = headers[p:p + 80]
+                expected_size = 80
+                p += 80
+            
+            # Check if we have enough data
+            if len(header_in_file) < expected_size:
+                break
+                
+            # Unpad if needed - returns 80 bytes for AuxPOW, 120 bytes for MeowPow
+            header_to_send = self._unpad_auxpow_header(header_in_file, h)
+            result += header_to_send
+            h += 1
+            processed_count += 1
+        
+        return result
 
     async def raw_header(self, height):
         '''Return the binary header at the given height.'''
         header, n = await self.read_headers(height, 1)
         if n != 1:
             raise IndexError(f'height {height:,d} out of range')
+        # Note: read_headers() already removes padding via _unpad_auxpow_headers
         return header
 
     async def read_headers(self, start_height, count):
@@ -812,6 +879,8 @@ class DB:
 
         Returns a (binary, n) pair where binary is the concatenated binary headers, and n
         is the count of headers returned.
+        
+        Note: AuxPOW headers are stored padded to 120 bytes but returned as 80 bytes for client compatibility.
         '''
         if start_height < 0 or count < 0:
             raise self.DBError(f'{count:,d} headers starting at '
@@ -820,10 +889,23 @@ class DB:
         def read_headers():
             # Read some from disk
             disk_count = max(0, min(count, self.state.height + 1 - start_height))
+            
+            # DEBUG: Log for problematic chunk
+            if start_height == 1620864:
+                self.logger.info(f'DEBUG read_headers: start_height={start_height}, requested_count={count}')
+                self.logger.info(f'DEBUG read_headers: state.height={self.state.height}')
+                self.logger.info(f'DEBUG read_headers: disk_count={disk_count}')
+            
             if disk_count:
                 offset = self.header_offset(start_height)
                 size = self.header_offset(start_height + disk_count) - offset
-                return self.headers_file.read(offset, size), disk_count
+                
+                headers_from_disk = self.headers_file.read(offset, size)
+                
+                # Remove padding from AuxPOW headers before returning
+                headers_unpadded = self._unpad_auxpow_headers(headers_from_disk, start_height)
+                
+                return headers_unpadded, disk_count
             return b'', 0
 
         return await run_in_thread(read_headers)
@@ -866,7 +948,18 @@ class DB:
         offset = 0
         headers = []
         for n in range(count):
-            hlen = self.header_len(height + n)
+            h = height + n
+            # Determine actual header length (unpadded) for splitting
+            # After reading, AuxPOW headers are 80 bytes, others use static_header_len
+            if self.coin.is_auxpow_active(h) and len(headers_concat) >= offset + 4:
+                version_int = int.from_bytes(headers_concat[offset:offset+4], byteorder='little')
+                if version_int & (1 << 8):  # AuxPOW block
+                    hlen = 80
+                else:
+                    hlen = self.header_len(h)
+            else:
+                hlen = self.header_len(h)
+            
             headers.append(headers_concat[offset:offset + hlen])
             offset += hlen
 
@@ -1183,18 +1276,41 @@ class DB:
         Used by the mempool code.
         '''
 
-        def lookup_hashXs():
-            '''Return (hashX, suffix) pairs, or None if not found,
-            for each prevout.
+        def lookup_prevouts():
+            '''Return (hashX, asset, value) tuples, or None if not found, for each prevout.
+            Checks BlockProcessor cache first for atomic mempool processing.
             '''
-            def lookup_hashX(tx_hash, tx_idx):
+            results = []
+            for tx_hash, tx_idx in prevouts:
                 idx_packed = pack_le_uint32(tx_idx)
-
+                
+                # FIXED: Check BlockProcessor cache FIRST for unflushed UTXOs
+                # This ensures atomic lookups when mempool processes TXs that spend
+                # outputs from recently processed but not-yet-flushed blocks
+                # Thread-safe: use dict.get() which is atomic, and copy the value immediately
+                if self.bp and self.bp.utxo_cache:
+                    cache_key = tx_hash + idx_packed
+                    # Use get() which is atomic - avoids KeyError if key removed during access
+                    cache_value = self.bp.utxo_cache.get(cache_key)
+                    if cache_value is not None:
+                        # Cache format: hashX (11 bytes) + asset_id (4 bytes) + value (8 bytes) + ...
+                        # Make defensive copy of bytes to avoid issues if cache is modified
+                        cache_value_bytes = bytes(cache_value)
+                        hashX = cache_value_bytes[:HASHX_LEN]
+                        asset_id = cache_value_bytes[HASHX_LEN:HASHX_LEN+4]
+                        value_bytes = cache_value_bytes[HASHX_LEN+4:HASHX_LEN+4+8]
+                        value, = unpack_le_uint64(value_bytes)
+                        asset_str = self.get_asset_for_id(asset_id)
+                        results.append((hashX, asset_str, value))
+                        continue  # Found in cache, skip DB lookup
+                
+                # Not in cache, look up in DB
                 # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
-                # Value: hashX
+                # Value: hashX + asset_id
                 prefix = PREFIX_UTXO_HISTORY + tx_hash[:4] + idx_packed
-
-                # Find which entry, if any, the TX_HASH matches.
+                found = False
+                
+                # Find which entry, if any, the TX_HASH matches
                 for db_key, db_val in self.utxo_db.iterator(prefix=prefix):
                     hashX = db_val[:HASHX_LEN]
                     asset_id = db_val[HASHX_LEN:]
@@ -1202,32 +1318,23 @@ class DB:
                     tx_num, = unpack_le_uint64(tx_num_packed + bytes(3))
                     fs_hash, _height = self.fs_tx_hash(tx_num)
                     if fs_hash == tx_hash:
-                        return hashX, asset_id, idx_packed + tx_num_packed
-                return None, None, None
-            return [lookup_hashX(*prevout) for prevout in prevouts]
-
-        def lookup_utxos(hashX_pairs):
-            def lookup_utxo(hashX, asset_id, suffix):
-                if not hashX:
-                    # This can happen when the daemon is a block ahead
-                    # of us and has mempool txs spending outputs from
-                    # that new block
-                    return None
-                # Key: b'u' + address_hashX + tx_idx + tx_num
-                # Value: the UTXO value as a 64-bit unsigned integer
-                key = PREFIX_HASHX_LOOKUP + hashX + asset_id + suffix
-                db_value = self.utxo_db.get(key)
-                if not db_value:
-                    # This can happen if the DB was updated between
-                    # getting the hashXs and getting the UTXOs
-                    return None
-                value, = unpack_le_uint64(db_value)
-                asset_str = self.get_asset_for_id(asset_id)
-                return hashX, asset_str, value
-            return [lookup_utxo(*hashX_pair) for hashX_pair in hashX_pairs]
-
-        hashX_pairs = await run_in_thread(lookup_hashXs)
-        return [i for i in await run_in_thread(lookup_utxos, hashX_pairs) if i]
+                        # Found the UTXO, now get its value
+                        # Key: b'u' + address_hashX + asset_id + tx_idx + tx_num
+                        key = PREFIX_HASHX_LOOKUP + hashX + asset_id + idx_packed + tx_num_packed
+                        db_value = self.utxo_db.get(key)
+                        if db_value:
+                            value, = unpack_le_uint64(db_value)
+                            asset_str = self.get_asset_for_id(asset_id)
+                            results.append((hashX, asset_str, value))
+                            found = True
+                        break
+                
+                if not found:
+                    results.append(None)
+            
+            return results
+        
+        return [i for i in await run_in_thread(lookup_prevouts) if i]
 
     # For external use
     
