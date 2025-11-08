@@ -38,5 +38,8 @@ Version 2.1.1 Changes
 * Increased default buffer sizes for improved performance
 * Enhanced network semaphore management for better resource usage
 * Added diagnostic logging for better debugging and performance monitoring
+* Dedicated thread pools keep block processing responsive under client load
+* LRU caches for history, transaction hashes, and merkle proofs expanded to 300k entries
+* AuxPOW header unpadding optimized for faster header streaming
 
 **Meowcoin Foundation**  https://github.com/Meowcoin-Foundation/electrumx-meowcoin
