@@ -333,6 +333,12 @@ class DB:
         
         self.asset_db: Storage = None
         self.suid_db: Storage = None
+        
+        # Reference to BlockProcessor for cache lookup (set by Controller)
+        self.bp = None
+        
+        # Thread pools for dedicated execution (set by Controller)
+        self.thread_pools = None
 
         self.logger.info(f'using {self.env.db_engine} for DB backend')
 
@@ -343,6 +349,16 @@ class DB:
         self.headers_file = util.LogicalFile('meta/headers', 2, 16000000)
         self.tx_counts_file = util.LogicalFile('meta/txcounts', 2, 2000000)
         self.hashes_file = util.LogicalFile('meta/hashes', 4, 16000000)
+
+    async def run_in_thread_client(self, func, *args):
+        '''Run a function in the client thread pool.
+        
+        Uses dedicated client pool if available, otherwise falls back to default pool.
+        '''
+        if self.thread_pools:
+            return await self.thread_pools.run_in_client_thread(func, *args)
+        else:
+            return await run_in_thread(func, *args)
 
     async def _read_tx_counts(self):
         if self.tx_counts is not None:
@@ -540,9 +556,12 @@ class DB:
         flush_data.state.flush_time = end_time
         flush_data.state.sync_time += flush_interval
 
-        # Update and flush state again so as not to drop the batch commit time
+        # CRITICAL: Always update db.state after flush so clients see correct height
+        # Sessions use db.state.height in _refresh_hsub_results (line 384 of session.py)
+        self.state = flush_data.state.copy()
+        
+        # Write UTXO state to disk only when doing full UTXO flush
         if flush_utxos:
-            self.state = flush_data.state.copy()
             self.write_utxo_state(self.utxo_db)
 
         size_delta = self.log_flush_stats('flush', flush_data, elapsed)
@@ -797,12 +816,91 @@ class DB:
         self.fs_h160_count = h160_count
         # Truncate header_mc: header count is 1 more than the height.
         self.header_mc.truncate(height + 1)
+    
+    def _unpad_auxpow_header(self, header, height):
+        '''Remove padding from AuxPOW headers before sending to clients.
+        
+        AuxPOW headers are stored as 120 bytes (80 + 40 padding) to maintain
+        static offsets, but clients expect 80 bytes for AuxPOW blocks.
+        '''
+        # Only process if AuxPOW is potentially active at this height
+        if not self.coin.is_auxpow_active(height):
+            return header
+        
+        # Check if this is an AuxPOW header (version bit set)
+        if len(header) >= 4:
+            version_int = int.from_bytes(header[:4], byteorder='little')
+            if version_int & (1 << 8):  # AuxPOW version bit
+                # Return only first 80 bytes, remove padding
+                return header[:80]
+        
+        return header
+    
+    def _unpad_auxpow_headers(self, headers, start_height):
+        '''Remove padding from multiple concatenated headers before sending to clients.
+        
+        Header storage format:
+        - Before KAWPOW_ACTIVATION_HEIGHT (373): 80 bytes per header
+        - After KAWPOW_ACTIVATION_HEIGHT: 120 bytes per header (for consistent offsets)
+          * MeowPow blocks: naturally 120 bytes
+          * AuxPOW blocks: 80 bytes basic header + 40 bytes padding
+        
+        This function reads headers from disk (all 120 bytes after KAWPOW activation)
+        and removes padding from AuxPOW headers (returns 80 bytes) before sending to clients.
+        MeowPow headers are returned as-is (120 bytes).
+        
+        Optimized to avoid repeated function calls and use efficient byte concatenation.
+        '''
+        # Use list + join instead of repeated concatenation (O(n) vs O(n²))
+        result_parts = []
+        p = 0
+        h = start_height
+        
+        # Cache constants to avoid repeated attribute lookups
+        kawpow_height = self.coin.KAWPOW_ACTIVATION_HEIGHT
+        auxpow_height = self.coin.AUXPOW_ACTIVATION_HEIGHT
+        
+        while p < len(headers):
+            # Each header in file is 120 bytes (after KAWPOW activation)
+            if h >= kawpow_height:
+                header_in_file = headers[p:p + 120]
+                expected_size = 120
+                p += 120
+            else:
+                header_in_file = headers[p:p + 80]
+                expected_size = 80
+                p += 80
+            
+            # Check if we have enough data
+            if len(header_in_file) < expected_size:
+                break
+            
+            # Inline unpadding logic to avoid function call overhead
+            # Only check AuxPOW if we're at or past activation height
+            if h >= auxpow_height and len(header_in_file) >= 4:
+                # Check if this is an AuxPOW header (version bit set)
+                version_int = int.from_bytes(header_in_file[:4], byteorder='little')
+                if version_int & (1 << 8):  # AuxPOW version bit
+                    # Return only first 80 bytes, remove padding
+                    result_parts.append(header_in_file[:80])
+                else:
+                    # MeowPow header, use full 120 bytes
+                    result_parts.append(header_in_file)
+            else:
+                # Before AuxPOW activation, return as-is
+                result_parts.append(header_in_file)
+            
+            h += 1
+        
+        # Single concatenation at the end (O(n) total instead of O(n²))
+        return b''.join(result_parts)
 
     async def raw_header(self, height):
         '''Return the binary header at the given height.'''
         header, n = await self.read_headers(height, 1)
         if n != 1:
             raise IndexError(f'height {height:,d} out of range')
+        # Note: read_headers() already removes padding via _unpad_auxpow_headers
         return header
 
     async def read_headers(self, start_height, count):
@@ -812,6 +910,8 @@ class DB:
 
         Returns a (binary, n) pair where binary is the concatenated binary headers, and n
         is the count of headers returned.
+        
+        Note: AuxPOW headers are stored padded to 120 bytes but returned as 80 bytes for client compatibility.
         '''
         if start_height < 0 or count < 0:
             raise self.DBError(f'{count:,d} headers starting at '
@@ -820,13 +920,26 @@ class DB:
         def read_headers():
             # Read some from disk
             disk_count = max(0, min(count, self.state.height + 1 - start_height))
+            
+            # DEBUG: Log for problematic chunk
+            if start_height == 1620864:
+                self.logger.info(f'DEBUG read_headers: start_height={start_height}, requested_count={count}')
+                self.logger.info(f'DEBUG read_headers: state.height={self.state.height}')
+                self.logger.info(f'DEBUG read_headers: disk_count={disk_count}')
+            
             if disk_count:
                 offset = self.header_offset(start_height)
                 size = self.header_offset(start_height + disk_count) - offset
-                return self.headers_file.read(offset, size), disk_count
+                
+                headers_from_disk = self.headers_file.read(offset, size)
+                
+                # Remove padding from AuxPOW headers before returning
+                headers_unpadded = self._unpad_auxpow_headers(headers_from_disk, start_height)
+                
+                return headers_unpadded, disk_count
             return b'', 0
 
-        return await run_in_thread(read_headers)
+        return await self.run_in_thread_client(read_headers)
 
     def fs_tx_hash(self, tx_num):
         '''Return a pair (tx_hash, tx_height) for the given tx number.
@@ -856,7 +969,7 @@ class DB:
         return [tx_hashes[idx * 32: (idx+1) * 32] for idx in range(num_txs_in_block)]
 
     async def tx_hashes_at_blockheight(self, block_height):
-        return await run_in_thread(self.fs_tx_hashes_at_blockheight, block_height)
+        return await self.run_in_thread_client(self.fs_tx_hashes_at_blockheight, block_height)
 
     async def fs_block_hashes(self, height, count):
         headers_concat, headers_count = await self.read_headers(height, count)
@@ -866,7 +979,18 @@ class DB:
         offset = 0
         headers = []
         for n in range(count):
-            hlen = self.header_len(height + n)
+            h = height + n
+            # Determine actual header length (unpadded) for splitting
+            # After reading, AuxPOW headers are 80 bytes, others use static_header_len
+            if self.coin.is_auxpow_active(h) and len(headers_concat) >= offset + 4:
+                version_int = int.from_bytes(headers_concat[offset:offset+4], byteorder='little')
+                if version_int & (1 << 8):  # AuxPOW block
+                    hlen = 80
+                else:
+                    hlen = self.header_len(h)
+            else:
+                hlen = self.header_len(h)
+            
             headers.append(headers_concat[offset:offset + hlen])
             offset += hlen
 
@@ -885,7 +1009,7 @@ class DB:
             return [fs_tx_hash(tx_num) for tx_num in tx_nums]
 
         while True:
-            history = await run_in_thread(read_history)
+            history = await self.run_in_thread_client(read_history)
             if all(hash is not None for hash, height in history):
                 return history
             self.logger.warning('limited_history: tx hash not found (reorg?), retrying...')
@@ -1171,7 +1295,7 @@ class DB:
             return utxos
 
         while True:
-            utxos = await run_in_thread(read_utxos)
+            utxos = await self.run_in_thread_client(read_utxos)
             if all(utxo.tx_hash is not None for utxo in utxos):
                 return utxos
             self.logger.warning('all_utxos: tx hash not found (reorg?), retrying...')
@@ -1183,18 +1307,41 @@ class DB:
         Used by the mempool code.
         '''
 
-        def lookup_hashXs():
-            '''Return (hashX, suffix) pairs, or None if not found,
-            for each prevout.
+        def lookup_prevouts():
+            '''Return (hashX, asset, value) tuples, or None if not found, for each prevout.
+            Checks BlockProcessor cache first for atomic mempool processing.
             '''
-            def lookup_hashX(tx_hash, tx_idx):
+            results = []
+            for tx_hash, tx_idx in prevouts:
                 idx_packed = pack_le_uint32(tx_idx)
-
+                
+                # FIXED: Check BlockProcessor cache FIRST for unflushed UTXOs
+                # This ensures atomic lookups when mempool processes TXs that spend
+                # outputs from recently processed but not-yet-flushed blocks
+                # Thread-safe: use dict.get() which is atomic, and copy the value immediately
+                if self.bp and self.bp.utxo_cache:
+                    cache_key = tx_hash + idx_packed
+                    # Use get() which is atomic - avoids KeyError if key removed during access
+                    cache_value = self.bp.utxo_cache.get(cache_key)
+                    if cache_value is not None:
+                        # Cache format: hashX (11 bytes) + asset_id (4 bytes) + value (8 bytes) + ...
+                        # Make defensive copy of bytes to avoid issues if cache is modified
+                        cache_value_bytes = bytes(cache_value)
+                        hashX = cache_value_bytes[:HASHX_LEN]
+                        asset_id = cache_value_bytes[HASHX_LEN:HASHX_LEN+4]
+                        value_bytes = cache_value_bytes[HASHX_LEN+4:HASHX_LEN+4+8]
+                        value, = unpack_le_uint64(value_bytes)
+                        asset_str = self.get_asset_for_id(asset_id)
+                        results.append((hashX, asset_str, value))
+                        continue  # Found in cache, skip DB lookup
+                
+                # Not in cache, look up in DB
                 # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
-                # Value: hashX
+                # Value: hashX + asset_id
                 prefix = PREFIX_UTXO_HISTORY + tx_hash[:4] + idx_packed
-
-                # Find which entry, if any, the TX_HASH matches.
+                found = False
+                
+                # Find which entry, if any, the TX_HASH matches
                 for db_key, db_val in self.utxo_db.iterator(prefix=prefix):
                     hashX = db_val[:HASHX_LEN]
                     asset_id = db_val[HASHX_LEN:]
@@ -1202,32 +1349,23 @@ class DB:
                     tx_num, = unpack_le_uint64(tx_num_packed + bytes(3))
                     fs_hash, _height = self.fs_tx_hash(tx_num)
                     if fs_hash == tx_hash:
-                        return hashX, asset_id, idx_packed + tx_num_packed
-                return None, None, None
-            return [lookup_hashX(*prevout) for prevout in prevouts]
-
-        def lookup_utxos(hashX_pairs):
-            def lookup_utxo(hashX, asset_id, suffix):
-                if not hashX:
-                    # This can happen when the daemon is a block ahead
-                    # of us and has mempool txs spending outputs from
-                    # that new block
-                    return None
-                # Key: b'u' + address_hashX + tx_idx + tx_num
-                # Value: the UTXO value as a 64-bit unsigned integer
-                key = PREFIX_HASHX_LOOKUP + hashX + asset_id + suffix
-                db_value = self.utxo_db.get(key)
-                if not db_value:
-                    # This can happen if the DB was updated between
-                    # getting the hashXs and getting the UTXOs
-                    return None
-                value, = unpack_le_uint64(db_value)
-                asset_str = self.get_asset_for_id(asset_id)
-                return hashX, asset_str, value
-            return [lookup_utxo(*hashX_pair) for hashX_pair in hashX_pairs]
-
-        hashX_pairs = await run_in_thread(lookup_hashXs)
-        return [i for i in await run_in_thread(lookup_utxos, hashX_pairs) if i]
+                        # Found the UTXO, now get its value
+                        # Key: b'u' + address_hashX + asset_id + tx_idx + tx_num
+                        key = PREFIX_HASHX_LOOKUP + hashX + asset_id + idx_packed + tx_num_packed
+                        db_value = self.utxo_db.get(key)
+                        if db_value:
+                            value, = unpack_le_uint64(db_value)
+                            asset_str = self.get_asset_for_id(asset_id)
+                            results.append((hashX, asset_str, value))
+                            found = True
+                        break
+                
+                if not found:
+                    results.append(None)
+            
+            return results
+        
+        return [i for i in await self.run_in_thread_client(lookup_prevouts) if i]
 
     # For external use
     
@@ -1259,7 +1397,7 @@ class DB:
             ret_val['tx_hash'] = hash_to_hex_str(tx_hash)
             ret_val['tx_pos'] = tx_pos
             return ret_val
-        return await run_in_thread(lookup_h160)
+        return await self.run_in_thread_client(lookup_h160)
 
     async def qualifications_for_h160_history(self, h160: bytes):
         def lookup_quals_history():
@@ -1287,7 +1425,7 @@ class DB:
                     'height': height,
                 })
             return sorted(history_items, key=lambda x: (x['height'], x['tx_hash']))
-        return await run_in_thread(lookup_quals_history)
+        return await self.run_in_thread_client(lookup_quals_history)
 
     async def qualifications_for_h160(self, h160: bytes):
         def lookup_quals():
@@ -1317,7 +1455,7 @@ class DB:
                     'height': height,
                 }
             return ret_val
-        return await run_in_thread(lookup_quals)
+        return await self.run_in_thread_client(lookup_quals)
 
     async def qualifications_for_qualifier_history(self, asset: bytes):
         def lookup_quals_history():
@@ -1345,7 +1483,7 @@ class DB:
                     'height': height,
                 })
             return sorted(history_items, key=lambda x: (x['height'], x['tx_hash']))
-        return await run_in_thread(lookup_quals_history)
+        return await self.run_in_thread_client(lookup_quals_history)
 
     async def qualifications_for_qualifier(self, asset: bytes):
         def lookup_quals():
@@ -1375,7 +1513,7 @@ class DB:
                     'height': height,
                 }
             return ret_val
-        return await run_in_thread(lookup_quals)
+        return await self.run_in_thread_client(lookup_quals)
 
     async def restricted_frozen_history(self, asset: bytes):
         def lookup_restricted_history():
@@ -1398,7 +1536,7 @@ class DB:
                     'height': height,
                 })
             return sorted(history_items, key=lambda x: (x['height'], x['tx_hash']))
-        return await run_in_thread(lookup_restricted_history)
+        return await self.run_in_thread_client(lookup_restricted_history)
 
     async def is_restricted_frozen(self, asset: bytes):
         def lookup_restricted():
@@ -1425,7 +1563,7 @@ class DB:
             ret_val['tx_hash'] = hash_to_hex_str(tx_hash)
             ret_val['tx_pos'] = tx_pos
             return ret_val
-        return await run_in_thread(lookup_restricted)
+        return await self.run_in_thread_client(lookup_restricted)
 
     async def get_restricted_string_history(self, asset: bytes):
         def lookup_restricted_history():
@@ -1450,7 +1588,7 @@ class DB:
                     'height': source_height
                 })
             return sorted(history_items, key=lambda x: (x['height'], x['tx_hash']))
-        return await run_in_thread(lookup_restricted_history)
+        return await self.run_in_thread_client(lookup_restricted_history)
 
 
     async def get_restricted_string(self, asset: bytes):
@@ -1478,7 +1616,7 @@ class DB:
             ret_val['restricted_tx_pos'] = restricted_tx_pos
             ret_val['qualifying_tx_pos'] = qualifying_tx_pos
             return ret_val
-        return await run_in_thread(lookup_restricted)
+        return await self.run_in_thread_client(lookup_restricted)
 
     async def lookup_qualifier_associations_history(self, asset: bytes):
         def lookup_associations_history():
@@ -1509,7 +1647,7 @@ class DB:
                     'height': height,
                 })
             return sorted(history_items, key=lambda x: (x['height'], x['tx_hash']))
-        return await run_in_thread(lookup_associations_history)
+        return await self.run_in_thread_client(lookup_associations_history)
 
     async def lookup_qualifier_associations(self, asset: bytes):
         def lookup_associations():
@@ -1541,7 +1679,7 @@ class DB:
                     'height': height,
                 }
             return ret_val
-        return await run_in_thread(lookup_associations)
+        return await self.run_in_thread_client(lookup_associations)
 
     async def lookup_messages(self, asset_name: bytes):
         def read_messages():
@@ -1566,12 +1704,12 @@ class DB:
                     'tx_pos': tx_pos,
                 })
             return ret_val
-        return await run_in_thread(read_messages)
+        return await self.run_in_thread_client(read_messages)
 
     async def get_assets_with_prefix(self, prefix: bytes):
         def find_assets():
             return [asset.decode('ascii') for asset, _ in self.suid_db.iterator(prefix=PREFIX_ASSET_TO_ID+prefix)]
-        return await run_in_thread(find_assets)
+        return await self.run_in_thread_client(find_assets)
 
     async def lookup_asset_meta_history(self, asset_name: bytes):
         def read_asset_meta_history():
@@ -1603,7 +1741,7 @@ class DB:
                 })
             return sorted(history_items, key=lambda x: (x['height'], x['tx_hash']))
         
-        return await run_in_thread(read_asset_meta_history)
+        return await self.run_in_thread_client(read_asset_meta_history)
 
 
     async def lookup_asset_meta(self, asset_name: bytes):
@@ -1664,4 +1802,4 @@ class DB:
                 }
 
             return to_ret
-        return await run_in_thread(read_assets_meta)
+        return await self.run_in_thread_client(read_assets_meta)

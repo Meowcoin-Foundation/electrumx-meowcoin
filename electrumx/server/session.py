@@ -142,17 +142,17 @@ class SessionManager:
         self.start_time = time.time()
         self._method_counts = defaultdict(int)
         self._reorg_count = 0
-        self._history_cache = pylru.lrucache(1000)
+        self._history_cache = pylru.lrucache(300000)
         self._history_lookups = 0
         self._history_hits = 0
-        self._tx_hashes_cache = pylru.lrucache(1000)
+        self._tx_hashes_cache = pylru.lrucache(300000)
         self._tx_hashes_lookups = 0
         self._tx_hashes_hits = 0
         # Really a MerkleCache cache
-        self._merkle_cache = pylru.lrucache(1000)
+        self._merkle_cache = pylru.lrucache(300000)
         self._merkle_lookups = 0
         self._merkle_hits = 0
-        self.estimatefee_cache = pylru.lrucache(1000)
+        self.estimatefee_cache = pylru.lrucache(300000)
         self.notified_height = None
         self.hsub_results = None
         self._sslc = None
@@ -306,7 +306,13 @@ class SessionManager:
 
     def _get_info(self):
         '''A summary of server state.'''
-        cache_fmt = '{:,d} lookups {:,d} hits {:,d} entries'
+        # Cache format with size and usage percentage
+        def cache_info(cache, lookups, hits):
+            size = len(cache)
+            capacity = cache.size()  # size() is a method in pylru
+            usage_pct = (size / capacity * 100) if capacity > 0 else 0
+            return f'{lookups:,d} lookups {hits:,d} hits {size:,d}/{capacity:,d} entries ({usage_pct:.1f}%)'
+        
         sessions = self.sessions
         return {
             'coin': self.env.coin.__name__,
@@ -315,10 +321,10 @@ class SessionManager:
             'db height': self.db.state.height,
             'db_flush_count': self.db.history.flush_count,
             'groups': len(self.session_groups),
-            'history cache': cache_fmt.format(
-                self._history_lookups, self._history_hits, len(self._history_cache)),
-            'merkle cache': cache_fmt.format(
-                self._merkle_lookups, self._merkle_hits, len(self._merkle_cache)),
+            'history cache': cache_info(
+                self._history_cache, self._history_lookups, self._history_hits),
+            'merkle cache': cache_info(
+                self._merkle_cache, self._merkle_lookups, self._merkle_hits),
             'pid': os.getpid(),
             'peers': self.peer_mgr.info(),
             'request counts': self._method_counts,
@@ -331,8 +337,8 @@ class SessionManager:
                 'pending requests': sum(s.unanswered_request_count() for s in sessions),
                 'subs': sum(s.sub_count() for s in sessions),
             },
-            'tx hashes cache': cache_fmt.format(
-                self._tx_hashes_lookups, self._tx_hashes_hits, len(self._tx_hashes_cache)),
+            'tx hashes cache': cache_info(
+                self._tx_hashes_cache, self._tx_hashes_lookups, self._tx_hashes_hits),
             'txs sent': self.txs_sent,
             'uptime': util.formatted_time(time.time() - self.start_time),
             'version': electrumx.version,
@@ -1525,7 +1531,8 @@ class ElectrumX(SessionBase):
 
         scripthash: the SHA256 hash of the script to subscribe to'''
         hashX = scripthash_to_hashX(scripthash)
-        return await self.hashX_subscribe(hashX, scripthash)
+        result = await self.hashX_subscribe(hashX, scripthash)
+        return result
 
     async def scripthash_unsubscribe(self, scripthash):
         '''Unsubscribe from a script hash.'''

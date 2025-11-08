@@ -16,6 +16,7 @@ import logging
 import os
 import pylru
 import traceback
+import time
 from collections import defaultdict
 from datetime import datetime
 from asyncio import sleep
@@ -118,6 +119,7 @@ class OnDiskBlock:
         self.size = size
         self.block_file = None
         self.header = None
+        self.header_end_offset = None  # Position after header where transactions start
 
     @classmethod
     def filename(cls, hex_hash, height):
@@ -125,7 +127,61 @@ class OnDiskBlock:
 
     def __enter__(self):
         self.block_file = open_file(self.filename(self.hex_hash, self.height))
-        self.header = self._read(self.coin.static_header_len(self.height))
+        
+        # FIXED: After AuxPOW activation, blocks can be:
+        # 1. Mined directly (MeowPow): version bit set, but NO AuxPOW structure
+        # 2. Merge-mined (Scrypt): version bit set AND has AuxPOW structure
+        # The version bit only indicates AuxPOW is enabled, not that this specific block has it
+        if self.coin.is_auxpow_active(self.height):
+            try:
+                # Peek at version to check version bit
+                peek_data = self.block_file.read(4)
+                if len(peek_data) < 4:
+                    raise RuntimeError(f'Cannot read version from block {self.hex_hash}')
+                self.block_file.seek(0)
+                version_int = int.from_bytes(peek_data[:4], byteorder='little')
+                
+                if self.coin.is_auxpow_block(version_int):  # AuxPOW version bit is set
+                    # Try to parse as AuxPOW block first
+                    # If it fails, it's a MeowPow direct block without AuxPOW structure
+                    from electrumx.lib.tx import DeserializerAuxPow
+                    peek_size = min(50000, self.size)
+                    raw_block_peek = self.block_file.read(peek_size)
+                    
+                    if len(raw_block_peek) < 80:
+                        # Block too small, treat as normal block
+                        self.block_file.seek(0)
+                    else:
+                        try:
+                            deserializer = DeserializerAuxPow(raw_block_peek)
+                            # Try to read header - this will fail if no AuxPOW structure exists
+                            self.header = deserializer.read_header(self.coin.BASIC_HEADER_SIZE, self.height)
+                            # If we got here, AuxPOW structure exists
+                            header_end_offset = deserializer.cursor
+                            
+                            if header_end_offset > self.size:
+                                raise RuntimeError(f'AuxPOW header parsing error: cursor {header_end_offset} exceeds block size {self.size}')
+                            
+                            self.header_end_offset = header_end_offset
+                            self.block_file.seek(header_end_offset)
+                            return self
+                        except (ValueError, IndexError, RuntimeError):
+                            # Failed to parse AuxPOW structure - this is a MeowPow direct block
+                            # According to Meowcoin code: if nVersion.IsAuxpow() but no AuxPOW structure,
+                            # header is 80 bytes (includes nNonce but not nHeight/nNonce64/mix_hash)
+                            logger.debug(f'Block {self.hex_hash} height {self.height}: AuxPOW bit set but no structure, treating as MeowPow direct (80-byte header)')
+                            self.block_file.seek(0)
+                            self.header = self._read(80)
+                            self.header_end_offset = 80
+                            return self
+            except Exception:
+                # Exception in AuxPOW detection, reset file position and fall through to pre-AuxPOW path
+                self.block_file.seek(0)
+        
+        # For blocks before AuxPOW activation, use static header length
+        header_len = self.coin.static_header_len(self.height)
+        self.header = self._read(header_len)
+        self.header_end_offset = header_len
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -133,8 +189,10 @@ class OnDiskBlock:
 
     def _read(self, size):
         result = self.block_file.read(size)
-        if not result:
-            raise RuntimeError(f'truncated block file for block {self.hex_hash} '
+        # Allow EOF (empty result) when we've already read some data
+        # Only raise error if file is completely empty from the start
+        if not result and self.block_file.tell() == 0:
+            raise RuntimeError(f'empty block file for block {self.hex_hash} '
                                f'height {self.height:,d}')
         return result
 
@@ -183,8 +241,15 @@ class OnDiskBlock:
     def _chunk_offsets(self):
         '''Iterate the transactions forwards to find their boundaries.'''
         base_offset = self.block_file.tell()
-        assert base_offset in (80, 120)
+        # CRITICAL FIX: For AuxPOW blocks, cursor can be at variable positions
+        # Don't assert fixed offsets - the __enter__ method positions correctly
+        # Just verify we're past the header (at least 80 bytes)
+        if base_offset < 80:
+            raise RuntimeError(f'Invalid base_offset {base_offset} - must be at least 80 (after header)')
         raw = self._read(self.chunk_size)
+        if not raw:
+            raise RuntimeError(f'No transaction data after header at offset {base_offset} '
+                               f'for block {self.hex_hash} height {self.height:,d} size {self.size}')
         deserializer = Deserializer(raw)
         tx_count = deserializer.read_varint()
         logger.info(f'backing up block {self.hex_hash} height {self.height:,d} '
@@ -209,6 +274,9 @@ class OnDiskBlock:
             if tx_count == 0:
                 return offsets
             raw = raw[cursor:] + self._read(self.chunk_size)
+            if not raw:
+                raise RuntimeError(f'Incomplete block data: {tx_count} transactions remaining '
+                                   f'for block {self.hex_hash} height {self.height:,d}')
             deserializer = Deserializer(raw)
 
     def iter_txs_reversed(self):
@@ -342,7 +410,7 @@ class BlockProcessor:
     up in case of chain reorganisations.
     '''
 
-    polling_delay = 5
+    polling_delay = 3  # Reduced from 5 to 3 for faster block detection
 
     def __init__(self, env: Env, db: DB, daemon: Daemon, notifications):
         self.env = env
@@ -361,6 +429,8 @@ class BlockProcessor:
         # A count >= 0 is a user-forced reorg; < 0 is a natural reorg
         self.reorg_count = None
         self.force_flush_arg = None
+        self.processing_blocks = False  # Track if advance_blocks() is processing
+        self.thread_pools = None  # Set by Controller after initialization
 
          # State.  Initially taken from DB;
         self.state = None
@@ -474,7 +544,10 @@ class BlockProcessor:
         # Remove stale blocks
         await OnDiskBlock.delete_blocks(first - 5, False)
 
-        return hex_hashes[:(count + 1) // 2], daemon_height
+        # Return ALL fetched blocks for faster sync (was returning only half)
+        # During initial sync with prefetch_limit=2000, we want to process
+        # all 2000 blocks immediately, not just 1000
+        return hex_hashes, daemon_height
 
     async def reorg_chain(self, count):
         '''Handle a chain reorganisation.
@@ -487,6 +560,71 @@ class BlockProcessor:
         else:
             logger.info(f'faking a reorg of {count:,d} blocks')
         await self.flush(True)
+        
+        # CRITICAL FIX: Ensure all caches are cleared before backup_block()
+        # backup_block() calls assert_flushed() which expects empty caches
+        # If flush() had early return due to empty headers, caches may still have data
+        # Clear them explicitly to prevent AssertionError
+        cache_counts_before = {
+            'headers': len(self.headers),
+            'utxo_cache': len(self.utxo_cache),
+            'tx_hashes': len(self.tx_hashes)
+        }
+        self.headers.clear()
+        self.tx_hashes.clear()
+        self.utxo_cache.clear()
+        self.utxo_deletes.clear()
+        self.utxo_undos.clear()
+        self.new_asset_ids.clear()
+        self.new_asset_ids_undos.clear()
+        self.asset_ids_deletes.clear()
+        self.new_h160_ids.clear()
+        self.new_h160_ids_undos.clear()
+        self.h160_ids_deletes.clear()
+        self.asset_metadata.clear()
+        self.asset_metadata_undos.clear()
+        self.asset_metadata_deletes.clear()
+        self.asset_metadata_history.clear()
+        self.asset_metadata_history_undos.clear()
+        self.asset_metadata_history_deletes.clear()
+        self.asset_broadcasts.clear()
+        self.asset_broadcasts_deletes.clear()
+        self.tags.clear()
+        self.tags_undos.clear()
+        self.tags_deletes.clear()
+        self.tag_history.clear()
+        self.tag_history_undos.clear()
+        self.tag_history_deletes.clear()
+        self.freezes.clear()
+        self.freezes_undos.clear()
+        self.freezes_deletes.clear()
+        self.freeze_history.clear()
+        self.freeze_history_undos.clear()
+        self.freeze_history_deletes.clear()
+        self.verifiers.clear()
+        self.verifiers_undos.clear()
+        self.verifiers_deletes.clear()
+        self.verifier_history.clear()
+        self.verifier_history_undos.clear()
+        self.verifier_history_deletes.clear()
+        self.associations.clear()
+        self.associations_undos.clear()
+        self.associations_deletes.clear()
+        self.association_history.clear()
+        self.association_history_undos.clear()
+        self.association_history_deletes.clear()
+        self.touched.clear()
+        self.asset_touched.clear()
+        self.qualifier_touched.clear()
+        self.h160_touched.clear()
+        self.broadcast_touched.clear()
+        self.frozen_touched.clear()
+        self.validator_touched.clear()
+        self.qualifier_association_touched.clear()
+        
+        # DEBUG: Log cache clearing if there was data (helps diagnose reorg issues)
+        if any(cache_counts_before.values()):
+            logger.debug(f'Reorg cache cleanup: cleared {cache_counts_before} before backup')
 
         start, hex_hashes = await self._reorg_hashes(count)
         pairs = reversed(list(enumerate(hex_hashes, start=start)))
@@ -499,7 +637,10 @@ class BlockProcessor:
             block = await OnDiskBlock.streamed_block(self.coin, hex_hash)
             if not block:
                 break
-            await self.run_with_lock(run_in_thread(self.backup_block, block))       
+            if self.thread_pools:
+                await self.run_with_lock(self.thread_pools.run_in_bp_thread(self.backup_block, block))
+            else:
+                await self.run_with_lock(run_in_thread(self.backup_block, block))       
         
         logger.info(f'backed up to height {self.state.height:,d}')
         self.backed_up_event.set()
@@ -579,12 +720,18 @@ class BlockProcessor:
         )
     async def flush(self, flush_utxos):
         self.force_flush_arg = None
+        # Skip flush if no new blocks (prevents double flush)
+        if not self.headers:
+            return
         # Estimate size remaining
         daemon_height = self.daemon.cached_height()
         tail_blocks = max(0, (daemon_height - max(self.state.height, self.coin.CHAIN_SIZE_HEIGHT)))
         size_remaining = (max(self.coin.CHAIN_SIZE - self.state.chain_size, 0) +
                           tail_blocks * self.coin.AVG_BLOCK_SIZE)
-        await run_in_thread(self.db.flush_dbs, self.flush_data(), flush_utxos, size_remaining)
+        if self.thread_pools:
+            await self.thread_pools.run_in_bp_thread(self.db.flush_dbs, self.flush_data(), flush_utxos, size_remaining)
+        else:
+            await run_in_thread(self.db.flush_dbs, self.flush_data(), flush_utxos, size_remaining)
 
     async def check_cache_size_loop(self):
         '''Signal to flush caches if they get too big.'''
@@ -646,45 +793,194 @@ class BlockProcessor:
             OnDiskBlock.log_block = True
             if hist_cache_size:
                 # Include height information - use current processing height
-                # During sync, db.state.height is not updated until flush, so add processed blocks
-                our_height = self.db.state.height + len(self.headers)
+                # Use self.state.height which is updated immediately after block processing
+                our_height = self.state.height
                 daemon_height = self.daemon.cached_height()
                 logger.info(f'our height: {our_height:,d} daemon: {daemon_height:,d} '
                           f'UTXOs {utxo_MB:,d}MB Assets {asset_MB:,d}MB hist {hist_MB:,d}MB')
 
             # Flush history if it takes up over 20% of cache memory.
             # Flush UTXOs once they take up 80% of cache memory.
-            if asset_MB + utxo_MB + hist_MB >= cache_MB or hist_MB >= cache_MB // 5:
-                self.force_flush_arg = (utxo_MB + asset_MB) >= cache_MB * 4 // 5
-            await sleep(30)
+            # When caught up, flush every block to ensure immediate client availability
+            blocks_pending = len(self.headers)
+            
+            cache_full = asset_MB + utxo_MB + hist_MB >= cache_MB
+            hist_full = hist_MB >= cache_MB // 5
+            blocks_ready = self.caught_up and blocks_pending >= 1
+            
+            # B.2: Detect lag and force processing
+            daemon_height = self.daemon.cached_height()
+            blocks_behind = daemon_height - self.state.height
+            
+            # Force flush if server is lagging behind daemon
+            lag_detected = blocks_behind > 1 and self.caught_up
+            
+            should_flush = cache_full or hist_full or blocks_ready or lag_detected
+            
+            if lag_detected:
+                logger.debug(f'Lag detected: {blocks_behind} blocks behind daemon, forcing flush')
+            
+            # CRITICAL: Don't interfere with batch processing
+            # If advance_blocks() is processing, defer flush request until batch completes
+            if self.processing_blocks:
+                await sleep(5)
+                continue
+            
+            if should_flush:
+                flush_utxos = (utxo_MB + asset_MB) >= cache_MB * 4 // 5
+                
+                # FIXED: Always use force_flush_arg for consistency
+                # Notifications will be handled by advance_and_maybe_flush() via on_block()
+                # This prevents duplicate notifications and ensures proper coordination via _maybe_notify()
+                self.force_flush_arg = flush_utxos
+            
+            await sleep(5)
 
     async def advance_blocks(self, hex_hashes):
         '''Process the blocks passed.  Detects and handles reorgs.'''
+        
+        async def advance_block_only(block):
+            '''Process a single block without flushing.'''
+            if self.thread_pools:
+                await self.thread_pools.run_in_bp_thread(self.advance_block, block)
+            else:
+                await run_in_thread(self.advance_block, block)
+        
+        async def do_flush_and_notify(flush_utxos, reason=""):
+            '''Flush and notify clients if caught up.'''
+            if self.headers:
+                await self.flush(flush_utxos)
+                
+                # When caught up, notify clients immediately after flush
+                if self.caught_up:
+                    await self.notifications.on_block(
+                        self.touched, self.state.height,
+                        self.asset_touched, self.qualifier_touched,
+                        self.h160_touched, self.broadcast_touched,
+                        self.frozen_touched, self.validator_touched,
+                        self.qualifier_association_touched
+                    )
+                    # Clear touched sets after notification
+                    self.touched = set()
+                    self.asset_touched = set()
+                    self.qualifier_touched = set()
+                    self.h160_touched = set()
+                    self.broadcast_touched = set()
+                    self.frozen_touched = set()
+                    self.validator_touched = set()
+                    self.qualifier_association_touched = set()
+                if reason:
+                    logger.debug(f'Flush triggered: {reason}')
 
-        async def advance_and_maybe_flush(block):
-            await run_in_thread(self.advance_block, block)
-            if self.force_flush_arg is not None:
-                await self.flush(self.force_flush_arg)
-
-        for hex_hash in hex_hashes:
-            # Stop if we must flush
-            if self.reorg_count is not None:
-                break
-            block = await OnDiskBlock.streamed_block(self.coin, hex_hash)
-            if not block:
-                break
-            await self.run_with_lock(advance_and_maybe_flush(block))
+        # Set processing flag to prevent check_cache_size_loop() interference
+        self.processing_blocks = True
+        
+        try:
+            batch_start_time = time.time()
+            batch_size = len(hex_hashes)
             
-        # If we've not caught up we have no clients for the touched set
-        if not self.caught_up:
-            self.touched = set()
-            self.asset_touched = set()
-            self.qualifier_touched = set()
-            self.h160_touched = set()
-            self.broadcast_touched = set()
-            self.frozen_touched = set()
-            self.validator_touched = set()
-            self.qualifier_association_touched = set()
+            if batch_size > 0:
+                logger.debug(f'Processing batch of {batch_size} blocks')
+            
+            # Process ALL blocks first - maximum speed, no waits
+            blocks_processed = 0
+            previous_block_hash = None
+            
+            for hex_hash in hex_hashes:
+                # Stop if we must flush (reorg detected)
+                if self.reorg_count is not None:
+                    # CRITICAL: If reorg detected during batch processing, flush any pending blocks first
+                    # This ensures undo information is saved before attempting backup
+                    if blocks_processed > 0 and self.headers:
+                        logger.debug(f'Reorg detected during batch processing, flushing {blocks_processed} processed blocks before backup')
+                        flush_reason = "reorg detected - flushing before backup"
+                        # CRITICAL FIX: Always flush with flush_utxos=True before reorg
+                        # Without undo info, backup_block() will fail
+                        flush_utxos = True
+                        if self.force_flush_arg is not None:
+                            flush_utxos = self.force_flush_arg
+                            self.force_flush_arg = None
+                        await do_flush_and_notify(flush_utxos, flush_reason)
+                    break
+                
+                block = await OnDiskBlock.streamed_block(self.coin, hex_hash)
+                if not block:
+                    break
+                
+                # Validate block ordering - read header directly to check prevhash
+                # This is done before advance_block() which uses 'with block:' context
+                try:
+                    with block:
+                        block_header = block.header
+                        if block_header is None:
+                            # Header not parsed yet, skip validation
+                            pass
+                        else:
+                            if previous_block_hash is not None:
+                                expected_prev_hash = self.coin.header_prevhash(block_header)
+                                if previous_block_hash != expected_prev_hash:
+                                    logger.warning(f'Block ordering issue: block {block.height} expected prevhash {hash_to_hex_str(expected_prev_hash)}, '
+                                                 f'but previous block hash was {hash_to_hex_str(previous_block_hash)}')
+                            elif blocks_processed == 0:
+                                # First block in batch - validate it connects to current tip
+                                expected_prev_hash = self.coin.header_prevhash(block_header)
+                                if self.state.tip != expected_prev_hash:
+                                    logger.warning(f'Block ordering issue: first block {block.height} expected prevhash {hash_to_hex_str(expected_prev_hash)}, '
+                                                 f'but current tip is {hash_to_hex_str(self.state.tip)}')
+                            
+                            # Store hash for next iteration validation
+                            previous_block_hash = self.coin.header_hash(block_header)
+                except Exception as e:
+                    # If validation fails, log but continue processing
+                    logger.debug(f'Could not validate block ordering for {hex_hash}: {e}')
+                
+                # Process block without flushing immediately
+                # advance_block() will use 'with block:' context internally
+                await self.run_with_lock(advance_block_only(block))
+                blocks_processed += 1
+            
+            # Calculate processing time
+            processing_time = time.time() - batch_start_time
+            
+            # CRITICAL: After processing ALL blocks, flush IMMEDIATELY (no delay)
+            # Check force_flush_arg only once after all blocks processed
+            # Skip flush if reorg was detected (already flushed above)
+            if blocks_processed > 0 and self.reorg_count is None:
+                flush_reason = ""
+                flush_utxos = False
+                
+                if self.force_flush_arg is not None:
+                    # Cache/history full - flush with UTXO flush if needed
+                    flush_utxos = self.force_flush_arg
+                    flush_reason = "cache/history full"
+                    self.force_flush_arg = None
+                elif self.caught_up and self.headers:
+                    # CRITICAL FIX: Always flush with flush_utxos=True when caught up
+                    # This ensures undo information is saved for every block
+                    # Without undo info, reorgs will fail with "no undo information found"
+                    # Undo info is small (~50KB/block) and critical for reorg handling
+                    flush_utxos = True
+                    flush_reason = "batch complete"
+                
+                if self.caught_up and self.headers:
+                    # Flush immediately - clients receive updates without delay
+                    logger.debug(f'Processed {blocks_processed} blocks in {processing_time:.2f}s, flushing immediately')
+                    await do_flush_and_notify(flush_utxos, flush_reason)
+            
+            # If we've not caught up we have no clients for the touched set
+            if not self.caught_up:
+                self.touched = set()
+                self.asset_touched = set()
+                self.qualifier_touched = set()
+                self.h160_touched = set()
+                self.broadcast_touched = set()
+                self.frozen_touched = set()
+                self.validator_touched = set()
+                self.qualifier_association_touched = set()
+        
+        finally:
+            # Always clear processing flag, even if exception occurs
+            self.processing_blocks = False
         
 
     def advance_block(self, block: OnDiskBlock):
@@ -782,20 +1078,17 @@ class BlockProcessor:
         utxo_count_delta = 0
 
         with block as raw_block:
-            # Read the complete raw block data
-            raw_block.block_file.seek(0)
-            complete_raw_block = raw_block.block_file.read()
+            # Header is already correctly parsed in __enter__ for both MeowPow and AuxPOW blocks
+            # No need to re-read the entire block - just validate prevhash and iterate transactions
             
-            # Parse the block using the coin's deserializer
-            parsed_block = self.coin.block(complete_raw_block, raw_block.height)
-            
-            if self.coin.header_prevhash(parsed_block.header) != self.state.tip:
+            if self.coin.header_prevhash(block.header) != self.state.tip:
                 self.reorg_count = -1
                 return
             
             self.ok = False
-            for tx in parsed_block.transactions:
-                tx_hash = tx.txid if hasattr(tx, 'txid') else double_sha256(tx.serialize())
+            # iter_txs() reads transactions from current file cursor (after header)
+            # This avoids re-reading the entire block that was already read in __enter__
+            for tx, tx_hash in block.iter_txs():
                 hashXs = []
                 inputHashXs = defaultdict(set)
                 append_hashX = hashXs.append
@@ -1288,7 +1581,20 @@ class BlockProcessor:
             self.verifier_history_undos.append((internal_verifier_history_undo_info, block.height))
             self.associations_undos.append((internal_association_undo_info, block.height))
             self.association_history_undos.append((internal_association_history_undo_info, block.height))
-        self.headers.append(block.header)
+        
+        # FIXED: Header storage padding logic
+        # After KAWPOW_ACTIVATION_HEIGHT (373), all headers in file are stored as 120 bytes
+        # - MeowPow blocks: naturally 120 bytes (includes nHeight/nNonce64/mix_hash)
+        # - AuxPOW blocks: 80 bytes basic header, padded to 120 for consistent offsets
+        # This ensures consistent file offsets regardless of block type
+        header_to_store = block.header
+        if block.height >= self.coin.KAWPOW_ACTIVATION_HEIGHT:
+            if self.coin.is_auxpow_active(block.height) and len(block.header) == 80:
+                # AuxPOW header (80 bytes) - pad to 120 for consistent disk storage
+                header_to_store = block.header + bytes(40)
+            # MeowPow headers are already 120 bytes, no padding needed
+        # Pre-KAWPOW headers are stored as-is (80 bytes)
+        self.headers.append(header_to_store)
         
         #Update State
         state.height = block.height
@@ -1444,9 +1750,30 @@ class BlockProcessor:
         is_unspendable = (is_unspendable_genesis if block.height >= genesis_activation
                           else is_unspendable_legacy)
         
-        undo_info = self.db.read_utxo_undo_info(block.height)
-        if undo_info is None:
-            raise ChainError(f'no undo information found for height {block.height:,d}')
+        # CRITICAL: Retry reading undo info with delay if not available immediately
+        # This handles race condition where flush completed but commit hasn't finished
+        undo_info = None
+        max_retries = 5
+        retry_delay = 0.1  # 100ms
+        
+        for attempt in range(max_retries):
+            undo_info = self.db.read_utxo_undo_info(block.height)
+            if undo_info is not None:
+                break
+            if attempt < max_retries - 1:
+                # Wait before retrying (flush commit may still be in progress)
+                time.sleep(retry_delay)
+                logger.debug(f'Undo info not available for height {block.height:,d}, retrying ({attempt + 1}/{max_retries})')
+            else:
+                # Check if block is below min_undo_height (undo info not saved)
+                daemon_height = self.daemon.cached_height()
+                min_undo = self.db.min_undo_height(daemon_height)
+                if block.height < min_undo:
+                    raise ChainError(f'no undo information found for height {block.height:,d} '
+                                   f'(below min_undo_height {min_undo:,d})')
+                else:
+                    raise ChainError(f'no undo information found for height {block.height:,d} '
+                                   f'after {max_retries} retries (flush may have failed)')
 
         n = len(undo_info)
 
@@ -1461,7 +1788,18 @@ class BlockProcessor:
 
         count = 0
         utxo_count_delta = 0
-        with block as block:
+        with block as raw_block:
+            # FIXED: Use header already parsed by OnDiskBlock.__enter__()
+            # The header is already correctly parsed for both MeowPow and AuxPOW blocks
+            # No need to re-parse - just ensure cursor is at correct position for iter_txs_reversed()
+            # Reset file cursor to position after header (set by __enter__)
+            if raw_block.header_end_offset is not None:
+                raw_block.block_file.seek(raw_block.header_end_offset)
+            else:
+                # Fallback: if header_end_offset not set, use static header length
+                header_len = self.coin.static_header_len(raw_block.height)
+                raw_block.block_file.seek(header_len)
+            
             self.ok = False
             for tx, tx_hash in block.iter_txs_reversed():
                 for idx, txout in enumerate(tx.outputs):
@@ -1659,21 +1997,11 @@ class BlockProcessor:
     async def on_caught_up(self):
         was_first_sync = self.state.first_sync
         self.state.first_sync = False
-        await self.flush(True)
-        if self.caught_up:
-            # Flush everything before notifying as client queries are performed on the DB
-            await self.notifications.on_block(self.touched, self.state.height, self.asset_touched,
-                                              self.qualifier_touched, self.h160_touched, self.broadcast_touched,
-                                              self.frozen_touched, self.validator_touched, self.qualifier_association_touched)
-            self.touched = set()
-            self.asset_touched = set()
-            self.qualifier_touched = set()
-            self.h160_touched = set()
-            self.broadcast_touched = set()
-            self.frozen_touched = set()
-            self.validator_touched = set()
-            self.qualifier_association_touched = set()
-        else:
+        # Only flush if NOT caught_up yet (first sync) or has pending blocks
+        # When caught_up, check_cache_size_loop handles all flushing
+        if not self.caught_up and self.headers:
+            await self.flush(True)
+        if not self.caught_up:
             self.caught_up = True
             if was_first_sync:
                 logger.info(f'{electrumx.version} synced to height {self.state.height:,d}')
